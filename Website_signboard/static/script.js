@@ -1,13 +1,37 @@
 // Global state
 let isDetecting = false;
 let detectionInterval;
+let videoRetryTimeout;
 
 // Initialize on page load
 document.addEventListener('DOMContentLoaded', function() {
     console.log('🎯 Signboard Detection Website Loaded');
+    initVideoFeed();
     checkCamera();
     startDetectionUpdates();
 });
+
+// Initialize/reconnect video feed stream
+function initVideoFeed() {
+    const videoFeed = document.getElementById('video-feed');
+    if (!videoFeed) return;
+
+    const streamUrl = `/video_feed?t=${Date.now()}`;
+    videoFeed.src = streamUrl;
+
+    videoFeed.onload = () => {
+        if (videoRetryTimeout) {
+            clearTimeout(videoRetryTimeout);
+            videoRetryTimeout = null;
+        }
+    };
+
+    videoFeed.onerror = () => {
+        console.error('Video feed disconnected, retrying...');
+        if (videoRetryTimeout) clearTimeout(videoRetryTimeout);
+        videoRetryTimeout = setTimeout(initVideoFeed, 1000);
+    };
+}
 
 // Start detection updates
 function startDetectionUpdates() {
@@ -109,6 +133,7 @@ function checkCamera() {
                 console.log('✅ Camera connected');
                 document.getElementById('status-text').textContent = 'Live';
                 document.getElementById('status-text').style.color = '#10b981';
+                initVideoFeed();
             } else {
                 console.error('❌ Camera error:', data.message);
                 alert('Camera Error: ' + data.message);

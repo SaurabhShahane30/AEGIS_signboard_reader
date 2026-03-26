@@ -1,3 +1,8 @@
-/raw_data
-/venv
-/.venv
+# Virtual environments
+venv/
+.venv311/
+.env
+
+# Python cache
+__pycache__/
+*.pyc

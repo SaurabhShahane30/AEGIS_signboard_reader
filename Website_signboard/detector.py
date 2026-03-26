@@ -39,9 +39,15 @@ class SignboardDetector:
         self.reader = easyocr.Reader(['en'], gpu=False)
         
         # Text-to-speech engine
-        self.tts_engine = pyttsx3.init()
-        self.tts_engine.setProperty('rate', 150)  # Speed
-        self.tts_engine.setProperty('volume', 0.9)  # Volume
+        self.tts_engine = None
+        self.tts_enabled = False
+        try:
+            self.tts_engine = pyttsx3.init()
+            self.tts_engine.setProperty('rate', 150)  # Speed
+            self.tts_engine.setProperty('volume', 0.9)  # Volume
+            self.tts_enabled = True
+        except Exception as e:
+            print(f"Warning: TTS disabled due to initialization error: {e}")
         
         # Queue to avoid duplicate voice reads
         self.read_texts = deque(maxlen=10)
@@ -193,6 +199,9 @@ class SignboardDetector:
     
     def read_text(self, text):
         """Speak out the detected text (non-blocking)"""
+        if not self.tts_enabled:
+            return
+
         if not text or len(text.strip()) == 0:
             return
             
