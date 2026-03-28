@@ -121,7 +121,7 @@ Alert style:
 Use calm, friendly, human-like phrasing
 Avoid rigid or robotic wording
 Do not use prefixes like "ALERT:"
-Keep under 15 words
+Keep under 20 words
 
 ROLE 2 — INTENT PARSER FOR PRIORITY MEMORY:
 
