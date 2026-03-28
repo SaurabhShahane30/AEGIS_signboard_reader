@@ -1,81 +1,80 @@
 """
-voice.py — Microphone input: wake word detection and command capture.
-
-Flow:
-  1. Continuously listens for WAKE_WORD ("hey system").
-  2. On match → speaks "Listening." and captures the follow-up command.
-  3. Pushes command string into state.speech_queue for llm_worker.
-
-Recognizer tuning:
-  - Lower energy threshold (300) catches quieter speech.
-  - Dynamic threshold adapts to ambient noise in real time.
-  - 0.6 s pause threshold for snappier end-of-speech detection.
-  - 2-second ambient noise calibration on startup.
+============================================================
+  voice.py — Wake-word detection and voice command capture
+============================================================
 """
 
 import time
 import speech_recognition as sr
-from . import state
-from .config import WAKE_WORD
-from .tts import speak
-from .session import end_session, log_event
 
-END_SESSION_PHRASES = {"end session", "end the session", "stop session", "finish session"}
+from .config import WAKE_WORD
+from . import state
+from .tts import speak
+
+# Phrases that signal a direct command without needing the wake word
+COMMAND_TRIGGERS = (
+    "add ", "remove ", "delete ", "clear ", "reset ",
+    "what are my", "list my", "show my",
+    "alert me", "notify me", "watch for", "remember",
+    "stop tracking", "don't alert", "don't track",
+)
+ 
+ 
+def _looks_like_command(text: str) -> bool:
+    t = text.lower()
+    return any(t.startswith(trigger) or trigger.strip() in t for trigger in COMMAND_TRIGGERS)
 
 def voice_worker():
-    """
-    Daemon thread: listens for the wake word then captures a voice command.
-    Pushes the command into state.speech_queue for the LLM worker to process.
-    """
     recognizer = sr.Recognizer()
     mic = sr.Microphone()
-
-    # ── Tuned settings for reliable wake-word detection ──
-    recognizer.energy_threshold         = 300    # lower = catches quieter speech
-    recognizer.dynamic_energy_threshold = True   # auto-adjusts to live ambient noise
-    recognizer.pause_threshold          = 0.6    # faster end-of-speech detection
-
+ 
+    recognizer.energy_threshold         = 300
+    recognizer.dynamic_energy_threshold = True
+    recognizer.pause_threshold          = 0.6
+ 
     print(f"[Voice] Wake word: '{WAKE_WORD.upper()}'")
     print("[Voice] Calibrating microphone for ambient noise (2 seconds)...")
     with mic as source:
         recognizer.adjust_for_ambient_noise(source, duration=2)
     print(f"[Voice] Calibration done. Energy threshold: {recognizer.energy_threshold:.0f}")
-
+    print("[Voice] List commands work at any time. Say 'hey system' for anything else.")
+ 
     while state.running:
         try:
-            # ── Listen for wake word ──────────────────────
             with mic as source:
-                audio = recognizer.listen(source, timeout=3, phrase_time_limit=6)
-
-            heard = recognizer.recognize_google(audio).lower()
-            print(f"[Voice] Heard: '{heard}'")
-
-            if WAKE_WORD not in heard:
-                continue
-
-            # ── Wake word matched — capture command ───────
-            speak("Listening.")
-            print("[Voice] Waiting for command...")
-            with mic as source:
-                cmd_audio = recognizer.listen(source, timeout=5, phrase_time_limit=8)
-
-            command = recognizer.recognize_google(cmd_audio).lower()
-            print(f"[Voice] Command: '{command}'")
-            
-            # ── Intercept "end session" — never send to LLM ──
-            if any(phrase in command for phrase in END_SESSION_PHRASES):
-                speak("Session ended. Starting a new session.")
-                log_event("command", "end session")
-                end_session(reason="user_command")
-                # system keeps running; end_session() starts a fresh session
+                audio = recognizer.listen(source, timeout=3, phrase_time_limit=8)
+ 
+            text = recognizer.recognize_google(audio).lower().strip()
+            if not text:
                 continue
  
-            state.speech_queue.put(command)
-
+            print(f"[Voice] Heard: '{text}'")
+ 
+            # ── Direct command — no wake word needed ─────────────
+            if _looks_like_command(text):
+                print("[Voice] Direct command detected.")
+                state.speech_queue.put(text)
+ 
+            # ── Wake word — open explicit listening window ────────
+            elif WAKE_WORD in text:
+                speak("Listening.")
+                print("[Voice] Waiting for command...")
+                try:
+                    with mic as source:
+                        cmd_audio = recognizer.listen(source, timeout=5, phrase_time_limit=8)
+                    command = recognizer.recognize_google(cmd_audio).lower().strip()
+                    if command:
+                        print(f"[Voice] Wake-word command: '{command}'")
+                        state.speech_queue.put(command)
+                except sr.WaitTimeoutError:
+                    speak("I didn't catch that.")
+                except sr.UnknownValueError:
+                    speak("Sorry, I couldn't understand.")
+ 
         except sr.WaitTimeoutError:
-            continue                   # silence timeout — normal
+            continue
         except sr.UnknownValueError:
-            continue                   # speech not recognised — normal
+            continue
         except sr.RequestError as e:
             print(f"[Voice Error] Google STT request failed: {e}")
             time.sleep(2)

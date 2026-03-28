@@ -1,38 +1,57 @@
 """
-main.py — Entry point for Vision Assistant.
+============================================================
+  VISION ASSISTANT — Main Entry Point
+  Stack: YOLOv8 (best.pt) + EasyOCR + Ollama (llama3.1) + gTTS
+============================================================
 
-Thread startup order:
-  1. TTS      — must be first so all other threads can call speak()
-  2. LLM      — processes voice commands and OCR alerts
-  3. Voice    — listens for wake word and commands
-  4. OCR      — runs EasyOCR on crops from camera (separate thread)
-  5. Camera   — YOLO inference + pushes crops (runs on main thread for OpenCV)
+SETUP:
+    1. Make sure Ollama is running:   ollama serve
+    2. Make sure model is pulled:     ollama pull llama3.1
+    3. Install Python deps:
+         pip install ultralytics easyocr opencv-python pyttsx3 \
+                     SpeechRecognition pyaudio numpy requests \
+                     sounddevice soundfile gtts
+    4. Set MODEL_PATH in config.py to your best.pt location.
+    5. Run:  python main.py
 
-Session lifecycle:
-  - start_session() called before threads start
-  - end_session() called on exit (user command or KeyboardInterrupt)
+VOICE COMMANDS (say "Hey system" first):
+    "add wet floor to priority"
+    "remove stop from priority"
+    "what are my priorities?"
+    "clear user list"
 """
 
 import sys
 import time
 import threading
+import os
 import requests
 
-from utils import state
-from utils.config import USE_ELEVENLABS, ELEVENLABS_API_KEY, ELEVENLABS_VOICE_ID, ELEVENLABS_MODEL_ID
+from utils.config import ALERT_SNAPSHOT_DIR, OLLAMA_URL
+from utils.state import running, user_priority_list
 from utils.tts import tts_worker, speak
 from utils.llm import llm_worker
 from utils.voice import voice_worker
-from utils.camera import camera_worker, ocr_worker
-from utils.session import start_session, end_session
+from utils.ocr import ocr_worker
+from utils.camera import camera_worker
 
 
-# ── Pre-flight checks ──────────────────────────────────────
+def main():
+    import utils.state as state
+    state.running = True
+    state.user_priority_list = set()  # always start empty
 
-def check_ollama():
+    print("=" * 60)
+    print("  VISION ASSISTANT  |  Ollama llama3.1  |  YOLOv8 + OCR")
+    print("=" * 60)
+
+    os.makedirs(ALERT_SNAPSHOT_DIR, exist_ok=True)
+    print(f"[Init] Alert snapshots will be saved to: {os.path.abspath(ALERT_SNAPSHOT_DIR)}/")
+
+    # ── Ollama connectivity check ──
     print("[Check] Pinging Ollama...")
     try:
-        requests.get("http://localhost:11434", timeout=3)
+        requests.get(OLLAMA_URL.replace("/api/generate", ""), timeout=3)
         print("[Check] Ollama is running ✓")
     except Exception:
         print("\n[ERROR] Ollama is not running!")
@@ -40,87 +59,48 @@ def check_ollama():
         print("        Then re-run this script.\n")
         sys.exit(1)
 
-
-def check_elevenlabs():
-    print("[Check] Testing ElevenLabs API key...")
-    if not ELEVENLABS_API_KEY:
-        print("[ERROR] ELEVENLABS_API_KEY is not set in your .env file!")
-        sys.exit(1)
-
+    # ── gTTS check ──
+    print("[Check] Verifying gTTS is available...")
     try:
-        test_resp = requests.post(
-            f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}",
-            headers={
-                "Accept": "audio/mpeg",
-                "Content-Type": "application/json",
-                "xi-api-key": ELEVENLABS_API_KEY,
-            },
-            json={"text": "ok", "model_id": ELEVENLABS_MODEL_ID},
-            timeout=10,
-        )
-        if test_resp.status_code == 200:
-            print("[Check] ElevenLabs connected ✓")
-        elif test_resp.status_code == 401:
-            print(f"[ERROR] ElevenLabs rejected API key: {test_resp.text}")
-            sys.exit(1)
-        else:
-            print(f"[WARN] ElevenLabs status {test_resp.status_code}: {test_resp.text}")
-
-    except Exception as e:
-        print(f"[ERROR] ElevenLabs unreachable: {e}")
+        from gtts import gTTS  # noqa: F401
+        print("[Check] gTTS is available ✓")
+    except ImportError:
+        print("[ERROR] gTTS is not installed!")
+        print("        Run:  pip install gtts")
         sys.exit(1)
-
-
-# ── Entry point ────────────────────────────────────────────
-
-def main():
-    print("=" * 60)
-    print("  VISION ASSISTANT  |  Ollama llama3.1  |  YOLOv8 + OCR")
-    print("=" * 60)
-
-    check_ollama()
-
-    if USE_ELEVENLABS:
-        check_elevenlabs()
-
-    start_session()
 
     threads = []
 
-    # 1. TTS first — every other thread may call speak()
     t_tts = threading.Thread(target=tts_worker, daemon=True, name="TTS")
     t_tts.start()
     threads.append(t_tts)
-    time.sleep(0.4)   # give TTS engine a moment to initialise
+    time.sleep(0.4)
 
     speak("Vision assistant starting up.")
 
-    # 2. LLM brain
     t_llm = threading.Thread(target=llm_worker, daemon=True, name="LLM")
     t_llm.start()
     threads.append(t_llm)
 
-    # 3. Voice input
     t_voice = threading.Thread(target=voice_worker, daemon=True, name="Voice")
     t_voice.start()
     threads.append(t_voice)
 
-    # 4. Dedicated OCR worker (receives crops from camera via state.crop_queue)
     t_ocr = threading.Thread(target=ocr_worker, daemon=True, name="OCR")
     t_ocr.start()
     threads.append(t_ocr)
 
-    # 5. Camera on main thread (required by OpenCV on most platforms)
+    # Camera runs on the main thread (required by OpenCV on Windows)
     try:
         camera_worker()
     except KeyboardInterrupt:
-        print("\n[Main] Interrupted by user.")
+        print("\n[Main] Interrupted.")
     finally:
         state.running = False
-        end_session(reason="process_exit")
-        print("[Main] Shutting down threads...")
+        print("[Main] Shutting down...")
         time.sleep(1)
         print("[Main] Done.")
+
 
 if __name__ == "__main__":
     main()

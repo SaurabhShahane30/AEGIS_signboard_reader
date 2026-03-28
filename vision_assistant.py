@@ -1,7 +1,7 @@
 """
 ============================================================
   VISION ASSISTANT — Complete System
-  Stack: YOLOv8 (best.pt) + EasyOCR + Ollama (llama3.1) + pyttsx3
+  Stack: YOLOv8 (best.pt) + EasyOCR + Ollama (llama3.1) + gTTS
   Author: Built for you
 ============================================================
 
@@ -11,7 +11,7 @@ SETUP:
     3. Install Python deps:
          pip install ultralytics easyocr opencv-python pyttsx3 \
                      SpeechRecognition pyaudio numpy requests \
-                     sounddevice soundfile
+                     sounddevice soundfile gtts
     4. Set MODEL_PATH below to your best.pt location.
     5. Run:  python vision_assistant.py
 
@@ -20,38 +20,6 @@ VOICE COMMANDS (say "Hey system" first):
     "remove stop from priority"
     "what are my priorities?"
     "clear user list"
-
-CHANGES vs previous version:
-    - ElevenLabs: uses /stream endpoint — no temp file written to disk
-    - ElevenLabs: startup connectivity + API key check added
-    - Wake word changed to "hey system" (more phonetically distinct)
-    - Voice recognizer: lower energy threshold, dynamic threshold ON,
-      shorter pause threshold, longer ambient noise calibration
-
-OCR CHANGES (this version):
-    - [OCR-1] EasyOCR moved to its own dedicated thread (ocr_worker)
-              Camera thread now only pushes crops — never blocks on readtext()
-    - [OCR-2] Fuzzy keyword matching added via difflib.SequenceMatcher
-              Catches OCR noise like "Wet Flo0r" matching "wet floor"
-    - [OCR-3] user_priority_list persisted to user_priorities.json
-              Loaded on startup, saved on every ADD / REMOVE / CLEAR
-    - [OCR-4] Crop preprocessing added (grayscale + CLAHE + denoise)
-              Improves EasyOCR accuracy on uneven lighting and shadows
-
-DIRECTION CHANGES (this version):
-    - [DIR-1] get_direction() computes relative sign position
-              (left / ahead-left / ahead / ahead-right / right)
-              using box center vs frame width, with span-overlap blending
-    - [DIR-2] alert_snapshot_dir created at startup (alert_snapshots/)
-    - [DIR-3] save_alert_snapshot() saves the full annotated frame
-              with the detected sign box highlighted and a label
-              stamped on it; filename encodes timestamp + sign text
-    - [DIR-4] crop_queue now carries (crop, (x1,y1,x2,y2), frame_ref)
-              so ocr_worker has the full box and latest annotated frame
-    - [DIR-5] Passive alerts and LLM alerts both append direction string
-    - [DIR-6] LLM prompt extended with direction context so the model
-              can include direction in its natural language response
-============================================================
 """
 
 import cv2
@@ -111,10 +79,10 @@ OLLAMA_MODEL         = "llama3.1:8b"
 # Speech output options
 TARGET_LANGUAGE      = "en"           # e.g. "en", "hi", "es"
 SOURCE_LANGUAGE      = "auto"
-USE_ELEVENLABS       = False
-ELEVENLABS_API_KEY   = os.getenv("ELEVENLABS_API_KEY", "")
-ELEVENLABS_VOICE_ID  = os.getenv("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")
-ELEVENLABS_MODEL_ID  = "eleven_multilingual_v2"
+USE_ELEVENLABS       = False          # Disabled — using gTTS
+ELEVENLABS_API_KEY   = ""
+ELEVENLABS_VOICE_ID  = ""
+ELEVENLABS_MODEL_ID  = ""
 TTS_HTTP_TIMEOUT_SEC = 12
 PRIORITY_REPEAT_COOLDOWN_SEC = 4    # suppress repeating same priority alert too often
 
@@ -406,8 +374,9 @@ def call_ollama(prompt: str, system_prompt: str = SYSTEM_PROMPT_WATCHER) -> str:
     except Exception as e:
         print(f"[Ollama Error] {e}")
         return "IGNORE"
+
 # ─────────────────────────────────────────────
-#  TTS THREAD
+#  TTS THREAD  (gTTS — replaces ElevenLabs)
 # ─────────────────────────────────────────────
 def get_translator():
     """Lazily initialize translator so startup stays fast and robust."""
@@ -474,32 +443,20 @@ def build_local_tts_engine():
         return None
 
 
-def speak_with_elevenlabs(text: str):
+def speak_with_gtts(text: str, lang: str = "en"):
     """
-    FIX: Synthesize speech with ElevenLabs using the /stream endpoint.
-    Audio bytes are piped directly to the player — no temp file is written to disk.
+    Synthesize speech with gTTS and play it in memory — no temp file written to disk.
+    Audio bytes are piped directly to the platform audio player.
     """
-    if not ELEVENLABS_API_KEY:
-        raise RuntimeError("ELEVENLABS_API_KEY is not set")
+    import io
+    from gtts import gTTS
 
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}/stream"
-    headers = {
-        "Accept": "audio/mpeg",
-        "Content-Type": "application/json",
-        "xi-api-key": ELEVENLABS_API_KEY,
-    }
-    payload = {
-        "text": text,
-        "model_id": ELEVENLABS_MODEL_ID,
-    }
+    tts = gTTS(text=text, lang=lang, slow=False)
 
-    resp = requests.post(
-        url, headers=headers, json=payload,
-        timeout=TTS_HTTP_TIMEOUT_SEC, stream=True
-    )
-    resp.raise_for_status()
-
-    audio_data = b"".join(resp.iter_content(chunk_size=4096))
+    # Write MP3 bytes into an in-memory buffer
+    audio_buffer = io.BytesIO()
+    tts.write_to_fp(audio_buffer)
+    audio_data = audio_buffer.getvalue()
 
     if sys.platform == "darwin":
         proc = subprocess.Popen(
@@ -521,7 +478,6 @@ def speak_with_elevenlabs(text: str):
 
     elif sys.platform.startswith("win"):
         try:
-            import io
             import sounddevice as sd
             import soundfile as sf
             audio_io = io.BytesIO(audio_data)
@@ -539,25 +495,26 @@ def speak_with_elevenlabs(text: str):
 
 def tts_worker():
     engine = None
-    if not USE_ELEVENLABS:
-        engine = build_local_tts_engine()
 
     while running:
         try:
             text = tts_queue.get(timeout=0.5)
 
             final_text = translate_for_speech(text)
+            # Use TARGET_LANGUAGE for gTTS; default to "en" if empty
+            gtts_lang = TARGET_LANGUAGE.lower() if TARGET_LANGUAGE else "en"
             print(f"\n🔊 {final_text}")
 
             spoken = False
 
-            if USE_ELEVENLABS:
-                try:
-                    speak_with_elevenlabs(final_text)
-                    spoken = True
-                except Exception as e:
-                    print(f"[TTS ElevenLabs Error] {e} | falling back to pyttsx3")
+            # ── Primary: gTTS ──────────────────────────────────────
+            try:
+                speak_with_gtts(final_text, lang=gtts_lang)
+                spoken = True
+            except Exception as e:
+                print(f"[TTS gTTS Error] {e} | falling back to pyttsx3")
 
+            # ── Fallback: pyttsx3 ──────────────────────────────────
             if not spoken:
                 if engine is None:
                     engine = build_local_tts_engine()
@@ -874,6 +831,11 @@ def ocr_worker():
                             direction,
                         )
                         speak(passive_alert)
+                        # One-time detection: clear user priority list after speaking
+                        if priority_key in user_priority_list:
+                            user_priority_list.discard(priority_key)
+                            save_priorities()
+                            print(f"[Priority] '{priority_key}' detected once — removed from list.")
 
                 elif len(text) > 3:
                     ocr_queue.put((text, direction))
@@ -991,35 +953,15 @@ def main():
         print("        Then re-run this script.\n")
         sys.exit(1)
 
-    if USE_ELEVENLABS:
-        print("[Check] Testing ElevenLabs API key...")
-        if not ELEVENLABS_API_KEY:
-            print("[ERROR] ELEVENLABS_API_KEY is not set in your .env file!")
-            sys.exit(1)
-        try:
-            test_resp = requests.post(
-                f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}",
-                headers={
-                    "Accept": "audio/mpeg",
-                    "Content-Type": "application/json",
-                    "xi-api-key": ELEVENLABS_API_KEY,
-                },
-                json={
-                    "text": "ok",
-                    "model_id": ELEVENLABS_MODEL_ID,
-                },
-                timeout=10,
-            )
-            if test_resp.status_code == 200:
-                print("[Check] ElevenLabs connected ✓")
-            elif test_resp.status_code == 401:
-                print(f"[ERROR] ElevenLabs rejected key: {test_resp.text}")
-                sys.exit(1)
-            else:
-                print(f"[WARN] ElevenLabs status {test_resp.status_code}: {test_resp.text}")
-        except Exception as e:
-            print(f"[ERROR] ElevenLabs unreachable: {e}")
-            sys.exit(1)
+    # ── gTTS connectivity check ──
+    print("[Check] Verifying gTTS is available...")
+    try:
+        from gtts import gTTS
+        print("[Check] gTTS is available ✓")
+    except ImportError:
+        print("[ERROR] gTTS is not installed!")
+        print("        Run:  pip install gtts")
+        sys.exit(1)
 
     threads = []
 

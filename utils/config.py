@@ -1,40 +1,54 @@
 """
-config.py — All configuration constants and environment variables.
+============================================================
+  config.py — All tuneable constants in one place
+============================================================
 """
 
-import os
-from dotenv import load_dotenv
+# ── Model & Camera ───────────────────────────────────────
+MODEL_PATH           = "signboard_project/best_yolov8s.pt"
+CAMERA_INDEX         = 0              # 0 = default webcam
 
-load_dotenv()
+# ── WebSocket streaming (for external display) ─────────────
+WS_HOST      = "0.0.0.0"
+WS_PORT      = 8765
+JPEG_QUALITY = 65
+STREAM_FPS   = 15
 
-# ── Model & Camera ─────────────────────────────────────────
-MODEL_PATH           = "./signboard_project/best_yolov8s.pt"
-CAMERA_INDEX         = 0
-CONFIDENCE_THRESHOLD = 0.5
-MIN_BOX_AREA         = 3000          # px² — ignore tiny/noisy detections
+# ── Detection thresholds ─────────────────────────────────
+CONFIDENCE_THRESHOLD = 0.5            # raise if too many false detections
+MIN_BOX_AREA         = 3000           # pixels² — ignore tiny/noisy boxes
 
-# ── Wake Word & Voice ──────────────────────────────────────
-WAKE_WORD            = "hey system"
+# ── Timing ───────────────────────────────────────────────
+OCR_COOLDOWN_SEC              = 4     # seconds before same text re-triggers
+LLM_RATE_LIMIT_SEC            = 2     # min gap between LLM calls
+PRIORITY_REPEAT_COOLDOWN_SEC  = 4     # suppress repeating same priority alert
 
-# ── OCR / LLM Rate Limiting ────────────────────────────────
-OCR_COOLDOWN_SEC      = 30   # seconds before same OCR text can re-enter pipeline
-LLM_RATE_LIMIT_SEC    = 2    # minimum gap between LLM calls
-LLM_ALERT_COOLDOWN_SEC = 30  # seconds before same LLM alert can be spoken again
+# ── Wake word ────────────────────────────────────────────
+WAKE_WORD = "hey system"
 
-# ── Ollama ─────────────────────────────────────────────────
-OLLAMA_URL           = "http://localhost:11434/api/generate"
-OLLAMA_MODEL         = "llama3.1:8b"
+# ── Ollama ───────────────────────────────────────────────
+OLLAMA_URL   = "http://localhost:11434/api/generate"
+OLLAMA_MODEL = "llama3.1:8b"
 
-# ── Speech / Translation ───────────────────────────────────
-TARGET_LANGUAGE      = "en"          # e.g. "en", "hi", "es"
+# ── Speech / Translation ─────────────────────────────────
+TARGET_LANGUAGE      = "en"           # e.g. "en", "hi", "es"
 SOURCE_LANGUAGE      = "auto"
+TTS_HTTP_TIMEOUT_SEC = 12
 
-# ── ElevenLabs ─────────────────────────────────────────────
-USE_ELEVENLABS        = True
-ELEVENLABS_API_KEY    = os.getenv("ELEVENLABS_API_KEY", "")
-ELEVENLABS_VOICE_ID   = os.getenv("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")
-ELEVENLABS_MODEL_ID   = "eleven_multilingual_v2"
-TTS_HTTP_TIMEOUT_SEC  = 12
+# ElevenLabs (disabled — using gTTS)
+USE_ELEVENLABS       = False
+ELEVENLABS_API_KEY   = ""
+ELEVENLABS_VOICE_ID  = ""
+ELEVENLABS_MODEL_ID  = ""
 
-# ── Alert Cooldown ─────────────────────────────────────────
-PRIORITY_REPEAT_COOLDOWN_SEC = 12
+# ── Persistence ──────────────────────────────────────────
+PRIORITY_FILE      = "user_priorities.json"
+ALERT_SNAPSHOT_DIR = "alert_snapshots"
+
+# ── Priority lists ───────────────────────────────────────
+CRITICAL_LIST = {
+    "stop", "danger", "no entry", "wet floor", "slippery road",
+    "hazard", "warning", "emergency", "fire", "poison",
+    "explosive", "high voltage", "do not enter", "keep out",
+    "restricted", "caution", "alert", "no exit", "blocked"
+}
