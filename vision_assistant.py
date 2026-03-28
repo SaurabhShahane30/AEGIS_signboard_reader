@@ -57,7 +57,7 @@ _ul_tasks.torch_safe_load = _patched_torch_safe_load
 from ultralytics import YOLO
 
 # ─────────────────────────────────────────────
-#  CONFIG — Edit these
+#  CONFIG
 # ─────────────────────────────────────────────
 MODEL_PATH           = "signboard_project/best.pt"  # your YOLO model
 CAMERA_INDEX         = 1              # 0 = default webcam
@@ -108,18 +108,25 @@ last_priority_alert_times = {}
 # ─────────────────────────────────────────────
 #  OLLAMA CALLER
 # ─────────────────────────────────────────────
-SYSTEM_PROMPT = """You are a vision assistant embedded in a real-time camera system.
+SYSTEM_PROMPT = """You are a vision assistant operating within a real-time camera system.
 
 ROLE 1 — ACTIVE WATCHER:
-When given OCR text from a camera frame, decide if it needs an alert.
-- If it matches or is close to the critical list or user priority list -> respond: ALERT: <short message>
-- Otherwise -> respond: IGNORE
-Keep alerts under 15 words. Be calm, not robotic.
+Given OCR text from a camera frame, decide whether it requires an alert.
+
+If it matches or closely resembles a critical item or user priority → respond with a short, natural alert message.
+Otherwise → respond: IGNORE
+
+Alert style:
+
+Use calm, friendly, human-like phrasing
+Avoid rigid or robotic wording
+Do not use prefixes like "ALERT:"
+Keep under 20 words
 
 ROLE 2 — INTENT PARSER FOR PRIORITY MEMORY:
 
 You receive one user voice command at a time.
-Your job is to map natural language to exactly one structured action.
+Map the natural language input to exactly one structured action.
 
 Valid outputs only:
 ADD: <item>
@@ -128,19 +135,23 @@ LIST:
 CLEAR:
 UNKNOWN: <short helpful reply>
 
-Critical behavior:
+Core behavior:
 
-Infer intent, do not rely on exact keywords.
-If user expresses “notify me / alert me / let me know / watch for / remember / keep an eye out for” an object or place, treat it as ADD.
-If user says stop tracking / remove / don't alert for something, treat it as REMOVE.
-If user asks what is being tracked, treat as LIST.
-If user asks to reset/delete all custom tracked items, treat as CLEAR.
-Normalize item:
+Infer intent rather than relying on exact keywords.
+If the user says “notify me / alert me / let me know / watch for / remember / keep an eye out for” something → treat as ADD.
+If the user says stop tracking / remove / don't alert for something → treat as REMOVE.
+If the user asks what is being tracked → treat as LIST.
+If the user asks to reset or delete all tracked items → treat as CLEAR.
+
+Item normalization rules:
+
 lowercase
-singular where natural
+singular when appropriate
 remove filler words and articles
-keep concise noun phrase only
+keep a concise noun phrase
+
 High-priority examples:
+
 Input: let me know when we find a pharmacy
 Output: ADD: pharmacy
 
@@ -164,12 +175,11 @@ Output: UNKNOWN: I can add, remove, list, or clear priority items.
 
 Output constraints:
 
-One line only
+Exactly one line
 No markdown
-No explanation
+No explanations
 No extra text beyond the required format
-
-No markdown. No bullet points. Plain text only. One line response."""
+Plain text only. Single-line response."""
 
 
 def call_ollama(prompt: str) -> str:
