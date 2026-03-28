@@ -15,6 +15,12 @@ running = True
 crop_queue   = queue.Queue(maxsize=5)
 speech_queue = queue.Queue()
 tts_queue    = queue.Queue()
+ws_frame_queue = queue.Queue(maxsize=5)   # Flutter → camera_worker frames
+
+# ── WebSocket state ───────────────────────────────────────
+ws_clients      = set()
+ws_clients_lock = threading.Lock()
+ws_event_queue  = queue.Queue()
 
 # ── Shared data structures ───────────────────────────────
 recent_texts             = deque(maxlen=30)
@@ -23,11 +29,6 @@ translation_cache        = {}
 
 # ── Synchronisation ──────────────────────────────────────
 lock = threading.Lock()
-
-# ── WebSocket clients (for real-time dashboard) ──
-ws_clients        = set()
-ws_clients_lock   = threading.Lock()
-ws_event_queue    = queue.Queue()
 
 # ── User priority list (populated by load_priorities) ────
 user_priority_list: set = set()

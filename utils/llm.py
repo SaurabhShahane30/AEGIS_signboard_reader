@@ -4,7 +4,6 @@
 ============================================================
 """
 
-import time
 import queue
 import requests
 
@@ -12,6 +11,7 @@ from .config import OLLAMA_URL, OLLAMA_MODEL
 from . import state
 from .tts import speak
 from .priority import priority_context
+from .websocket_server import broadcast_event
 
 
 # ─────────────────────────────────────────────────────────
@@ -102,30 +102,40 @@ def call_ollama(prompt: str, system_prompt: str = SYSTEM_PROMPT_WATCHER) -> str:
  
 def _handle_command_response(response: str):
     upper = response.upper()
+
+    try:
+        _broadcast = broadcast_event
+    except Exception:
+        _broadcast = lambda e: None  # noqa: E731
  
     if upper.startswith("ADD:"):
         item = response[4:].strip().lower()
         state.user_priority_list.add(item)
         speak(f"Added {item} to your priority list.")
         print(f"[Priority] User list: {state.user_priority_list}")
+        _broadcast({"type": "priorities_updated", "priorities": list(state.user_priority_list)})
  
     elif upper.startswith("REMOVE:"):
         item = response[7:].strip().lower()
         if item in state.user_priority_list:
             state.user_priority_list.discard(item)
             speak(f"Removed {item} from your priority list.")
+            _broadcast({"type": "priorities_updated", "priorities": list(state.user_priority_list)})
         else:
             speak(f"{item} was not in your list.")
  
     elif upper.startswith("LIST:"):
-        if state.user_priority_list:
-            speak(f"Your priorities are: {', '.join(sorted(state.user_priority_list))}")
+        priorities = sorted(state.user_priority_list)
+        if priorities:
+            speak(f"Your priorities are: {', '.join(priorities)}")
         else:
             speak("Your custom priority list is empty.")
+        _broadcast({"type": "priorities_updated", "priorities": priorities})
  
     elif upper.startswith("CLEAR:"):
         state.user_priority_list.clear()
         speak("Custom priority list cleared.")
+        _broadcast({"type": "priorities_updated", "priorities": []})
  
     elif upper.startswith("UNKNOWN:"):
         speak(response[8:].strip())
@@ -153,8 +163,6 @@ def llm_worker():
             state.speech_queue.task_done()
         except queue.Empty:
             continue
- 
-            state.ocr_queue.task_done()
  
         except queue.Empty:
             continue

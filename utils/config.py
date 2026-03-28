@@ -4,9 +4,14 @@
 ============================================================
 """
 
+# ── Input source ─────────────────────────────────────────
+# "local"   = laptop camera + laptop microphone
+# "flutter" = video frames + voice commands from Flutter over WebSocket
+INPUT_SOURCE = "local"
+
 # ── Model & Camera ───────────────────────────────────────
 MODEL_PATH           = "signboard_project/best_yolov8s.pt"
-CAMERA_INDEX         = 0              # 0 = default webcam
+CAMERA_INDEX         = 0              # 0 = default webcam. Used if input source is "local".
 
 # ── WebSocket streaming (for external display) ─────────────
 WS_HOST      = "0.0.0.0"
@@ -20,7 +25,7 @@ MIN_BOX_AREA         = 3000           # pixels² — ignore tiny/noisy boxes
 
 # ── Timing ───────────────────────────────────────────────
 OCR_COOLDOWN_SEC              = 4     # seconds before same text re-triggers
-LLM_RATE_LIMIT_SEC            = 2     # min gap between LLM calls
+LLM_RATE_LIMIT_SEC            = 4     # min gap between LLM calls
 PRIORITY_REPEAT_COOLDOWN_SEC  = 4     # suppress repeating same priority alert
 
 # ── Wake word ────────────────────────────────────────────
@@ -34,12 +39,6 @@ OLLAMA_MODEL = "llama3.1:8b"
 TARGET_LANGUAGE      = "en"           # e.g. "en", "hi", "es"
 SOURCE_LANGUAGE      = "auto"
 TTS_HTTP_TIMEOUT_SEC = 12
-
-# ElevenLabs (disabled — using gTTS)
-USE_ELEVENLABS       = False
-ELEVENLABS_API_KEY   = ""
-ELEVENLABS_VOICE_ID  = ""
-ELEVENLABS_MODEL_ID  = ""
 
 # ── Persistence ──────────────────────────────────────────
 PRIORITY_FILE      = "user_priorities.json"

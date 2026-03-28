@@ -9,9 +9,11 @@ import sys
 import io
 import queue
 import subprocess
+from datetime import datetime
 
 from .config import TARGET_LANGUAGE, SOURCE_LANGUAGE
 from . import state
+from .websocket_server import broadcast_event   
 
 try:
     from googletrans import Translator
@@ -66,7 +68,6 @@ def translate_for_speech(text: str) -> str:
     except Exception as e:
         print(f"[Translate Error] {e}")
         return text
-
 
 # ─────────────────────────────────────────────────────────
 #  pyttsx3 fallback engine
@@ -156,8 +157,18 @@ def tts_worker():
             gtts_lang  = TARGET_LANGUAGE.lower() if TARGET_LANGUAGE else "en"
             print(f"\n🔊 {final_text}")
 
+            # ── Broadcast alert text to Flutter ───────────────────
+            try:
+                broadcast_event({
+                    "type":      "alert",
+                    "text":      final_text,
+                    "timestamp": datetime.now().isoformat(),
+                })
+            except Exception as e:
+                print(f"[TTS WS Error] {e}")
+ 
             spoken = False
-
+            
             # Primary: gTTS
             try:
                 speak_with_gtts(final_text, lang=gtts_lang)

@@ -27,22 +27,23 @@ import threading
 import os
 import requests
 
-from utils.config import ALERT_SNAPSHOT_DIR, OLLAMA_URL
-from utils.state import running, user_priority_list
+from utils.config import ALERT_SNAPSHOT_DIR, OLLAMA_URL, INPUT_SOURCE
+import utils.state as state
 from utils.tts import tts_worker, speak
 from utils.llm import llm_worker
 from utils.voice import voice_worker
 from utils.ocr import ocr_worker
 from utils.camera import camera_worker
+from utils.websocket_server import start_ws_server, print_connection_info
 
 
 def main():
-    import utils.state as state
     state.running = True
     state.user_priority_list = set()  # always start empty
 
     print("=" * 60)
     print("  VISION ASSISTANT  |  Ollama llama3.1  |  YOLOv8 + OCR")
+    print(f"  Input source: {INPUT_SOURCE.upper()}")
     print("=" * 60)
 
     os.makedirs(ALERT_SNAPSHOT_DIR, exist_ok=True)
@@ -69,8 +70,25 @@ def main():
         print("        Run:  pip install gtts")
         sys.exit(1)
 
+    # ── websockets check ─────────────────────────────────────
+    print("[Check] Verifying websockets is available...")
+    try:
+        import websockets  # noqa: F401
+        print("[Check] websockets is available ✓")
+    except ImportError:
+        print("[ERROR] websockets not installed. Run:  pip install websockets")
+        sys.exit(1)
+
     threads = []
 
+    # ── WebSocket server (always started) ────────────────────
+    t_ws = threading.Thread(target=start_ws_server, daemon=True, name="WebSocket")
+    t_ws.start()
+    threads.append(t_ws)
+    time.sleep(0.5)
+    print_connection_info()
+
+    # ── TTS ──────────────────────────────────────────────────
     t_tts = threading.Thread(target=tts_worker, daemon=True, name="TTS")
     t_tts.start()
     threads.append(t_tts)
@@ -78,13 +96,18 @@ def main():
 
     speak("Vision assistant starting up.")
 
+    # ── LLM brain ────────────────────────────────────────────
     t_llm = threading.Thread(target=llm_worker, daemon=True, name="LLM")
     t_llm.start()
     threads.append(t_llm)
 
-    t_voice = threading.Thread(target=voice_worker, daemon=True, name="Voice")
-    t_voice.start()
-    threads.append(t_voice)
+    # ── Voice input — laptop mic only when source is local ───
+    if INPUT_SOURCE == "local":
+        t_voice = threading.Thread(target=voice_worker, daemon=True, name="Voice")
+        t_voice.start()
+        threads.append(t_voice)
+    else:
+        print("[Voice] Flutter source — voice commands arrive over WebSocket.")
 
     t_ocr = threading.Thread(target=ocr_worker, daemon=True, name="OCR")
     t_ocr.start()
