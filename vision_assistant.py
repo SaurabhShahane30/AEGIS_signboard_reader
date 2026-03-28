@@ -66,7 +66,7 @@ _ul_tasks.torch_safe_load = _patched_torch_safe_load
 from ultralytics import YOLO
 
 # ─────────────────────────────────────────────
-#  CONFIG — Edit these
+#  CONFIG
 # ─────────────────────────────────────────────
 MODEL_PATH           = "signboard_project/best_yolov8s.pt"  # your YOLO model
 CAMERA_INDEX         = 1              # 0 = default webcam
@@ -136,6 +136,7 @@ ROLE 2 — INTENT PARSER FOR PRIORITY MEMORY:
 
 You receive one user voice command at a time.
 Map the natural language input to exactly one structured action.
+Map the natural language input to exactly one structured action.
 
 Valid outputs only:
 ADD: <item>
@@ -146,21 +147,18 @@ UNKNOWN: <short helpful reply>
 
 Core behavior:
 
-Infer intent rather than relying on exact keywords.
-If the user says “notify me / alert me / let me know / watch for / remember / keep an eye out for” something → treat as ADD.
-If the user says stop tracking / remove / don't alert for something → treat as REMOVE.
-If the user asks what is being tracked → treat as LIST.
-If the user asks to reset or delete all tracked items → treat as CLEAR.
-
-Item normalization rules:
-
+Infer intent, do not rely on exact keywords.
+If user expresses “notify me / alert me / let me know / watch for / remember / keep an eye out for” an object or place, treat it as ADD.
+If user says stop tracking / remove / don't alert for something, treat it as REMOVE.
+If user asks what is being tracked, treat as LIST.
+If user asks to reset/delete all custom tracked items, treat as CLEAR.
+Normalize item:
 lowercase
 singular when appropriate
 remove filler words and articles
 keep a concise noun phrase
 
 High-priority examples:
-
 Input: let me know when we find a pharmacy
 Output: ADD: pharmacy
 
