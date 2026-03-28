@@ -10,7 +10,8 @@ SETUP:
     2. Make sure model is pulled:     ollama pull llama3.1
     3. Install Python deps:
          pip install ultralytics easyocr opencv-python pyttsx3 \
-                     SpeechRecognition pyaudio numpy requests
+                     SpeechRecognition pyaudio numpy requests \
+                     sounddevice soundfile
     4. Set MODEL_PATH below to your best.pt location.
     5. Run:  python vision_assistant.py
 
@@ -19,6 +20,13 @@ VOICE COMMANDS (say "Hey system" first):
     "remove stop from priority"
     "what are my priorities?"
     "clear user list"
+
+CHANGES vs previous version:
+    - ElevenLabs: uses /stream endpoint — no temp file written to disk
+    - ElevenLabs: startup connectivity + API key check added
+    - Wake word changed to "hey system" (more phonetically distinct)
+    - Voice recognizer: lower energy threshold, dynamic threshold ON,
+      shorter pause threshold, longer ambient noise calibration
 ============================================================
 """
 
@@ -28,7 +36,8 @@ import time
 import queue
 import sys
 import os
-import tempfile
+from dotenv import load_dotenv
+load_dotenv()
 import subprocess
 import requests
 import numpy as np
@@ -59,20 +68,20 @@ from ultralytics import YOLO
 # ─────────────────────────────────────────────
 #  CONFIG — Edit these
 # ─────────────────────────────────────────────
-MODEL_PATH           = "signboard_project/best.pt"  # your YOLO model
+MODEL_PATH           = "signboard_project/best_yolov8s.pt"  # your YOLO model
 CAMERA_INDEX         = 1              # 0 = default webcam
-WAKE_WORD            = "hello system"    # voice trigger phrase
+WAKE_WORD            = "hey system"   # FIX: changed from "hello system" — more phonetically distinct
 OCR_COOLDOWN_SEC     = 4              # seconds before same text re-triggers
-LLM_RATE_LIMIT_SEC   = 2              # min gap between LLM calls
+LLM_RATE_LIMIT_SEC   = 2             # min gap between LLM calls
 CONFIDENCE_THRESHOLD = 0.5            # raise this if too many false detections
 MIN_BOX_AREA         = 3000           # pixels² — ignore tiny/noisy boxes
 OLLAMA_URL           = "http://localhost:11434/api/generate"
 OLLAMA_MODEL         = "llama3.1:8b"
 
 # Speech output options
-TARGET_LANGUAGE      = "hi"            # e.g. "en", "hi", "es"
+TARGET_LANGUAGE      = "en"           # e.g. "en", "hi", "es"
 SOURCE_LANGUAGE      = "auto"
-USE_ELEVENLABS       = False
+USE_ELEVENLABS       = True
 ELEVENLABS_API_KEY   = os.getenv("ELEVENLABS_API_KEY", "")
 ELEVENLABS_VOICE_ID  = os.getenv("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")
 ELEVENLABS_MODEL_ID  = "eleven_multilingual_v2"
@@ -108,18 +117,25 @@ last_priority_alert_times = {}
 # ─────────────────────────────────────────────
 #  OLLAMA CALLER
 # ─────────────────────────────────────────────
-SYSTEM_PROMPT = """You are a vision assistant embedded in a real-time camera system.
+SYSTEM_PROMPT = """You are a vision assistant operating within a real-time camera system.
 
 ROLE 1 — ACTIVE WATCHER:
-When given OCR text from a camera frame, decide if it needs an alert.
-- If it matches or is close to the critical list or user priority list -> respond: ALERT: <short message>
-- Otherwise -> respond: IGNORE
-Keep alerts under 15 words. Be calm, not robotic.
+Given OCR text from a camera frame, decide whether it requires an alert.
+
+If it matches or closely resembles a critical item or user priority → respond with a short, natural alert message.
+Otherwise → respond: IGNORE
+
+Alert style:
+
+Use calm, friendly, human-like phrasing
+Avoid rigid or robotic wording
+Do not use prefixes like "ALERT:"
+Keep under 15 words
 
 ROLE 2 — INTENT PARSER FOR PRIORITY MEMORY:
 
 You receive one user voice command at a time.
-Your job is to map natural language to exactly one structured action.
+Map the natural language input to exactly one structured action.
 
 Valid outputs only:
 ADD: <item>
@@ -128,19 +144,23 @@ LIST:
 CLEAR:
 UNKNOWN: <short helpful reply>
 
-Critical behavior:
+Core behavior:
 
-Infer intent, do not rely on exact keywords.
-If user expresses “notify me / alert me / let me know / watch for / remember / keep an eye out for” an object or place, treat it as ADD.
-If user says stop tracking / remove / don't alert for something, treat it as REMOVE.
-If user asks what is being tracked, treat as LIST.
-If user asks to reset/delete all custom tracked items, treat as CLEAR.
-Normalize item:
+Infer intent rather than relying on exact keywords.
+If the user says “notify me / alert me / let me know / watch for / remember / keep an eye out for” something → treat as ADD.
+If the user says stop tracking / remove / don't alert for something → treat as REMOVE.
+If the user asks what is being tracked → treat as LIST.
+If the user asks to reset or delete all tracked items → treat as CLEAR.
+
+Item normalization rules:
+
 lowercase
-singular where natural
+singular when appropriate
 remove filler words and articles
-keep concise noun phrase only
+keep a concise noun phrase
+
 High-priority examples:
+
 Input: let me know when we find a pharmacy
 Output: ADD: pharmacy
 
@@ -164,12 +184,11 @@ Output: UNKNOWN: I can add, remove, list, or clear priority items.
 
 Output constraints:
 
-One line only
+Exactly one line
 No markdown
-No explanation
+No explanations
 No extra text beyond the required format
-
-No markdown. No bullet points. Plain text only. One line response."""
+Plain text only. Single-line response."""
 
 
 def call_ollama(prompt: str) -> str:
@@ -264,14 +283,15 @@ def build_local_tts_engine():
 
 
 def speak_with_elevenlabs(text: str):
-    """Synthesize speech with ElevenLabs and play locally.
-
-    Runs inside the dedicated TTS thread, so camera/OCR threads remain non-blocking.
+    """
+    FIX: Synthesize speech with ElevenLabs using the /stream endpoint.
+    Audio bytes are piped directly to the player — no temp file is written to disk.
     """
     if not ELEVENLABS_API_KEY:
         raise RuntimeError("ELEVENLABS_API_KEY is not set")
 
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}"
+    # Use /stream endpoint instead of plain /text-to-speech
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}/stream"
     headers = {
         "Accept": "audio/mpeg",
         "Content-Type": "application/json",
@@ -282,40 +302,52 @@ def speak_with_elevenlabs(text: str):
         "model_id": ELEVENLABS_MODEL_ID,
     }
 
-    resp = requests.post(url, headers=headers, json=payload, timeout=TTS_HTTP_TIMEOUT_SEC)
+    resp = requests.post(
+        url, headers=headers, json=payload,
+        timeout=TTS_HTTP_TIMEOUT_SEC, stream=True
+    )
     resp.raise_for_status()
 
-    temp_path = None
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp_file:
-            temp_file.write(resp.content)
-            temp_path = temp_file.name
+    # Collect all audio bytes in memory — no file written to disk
+    audio_data = b"".join(resp.iter_content(chunk_size=4096))
 
-        if sys.platform == "darwin":
-            subprocess.run(
-                ["afplay", temp_path],
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+    if sys.platform == "darwin":
+        # macOS: afplay supports reading from stdin
+        proc = subprocess.Popen(
+            ["afplay", "-"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        proc.communicate(input=audio_data)
+
+    elif sys.platform.startswith("linux"):
+        # Linux: ffplay reads from pipe:0
+        proc = subprocess.Popen(
+            ["ffplay", "-nodisp", "-autoexit", "-i", "pipe:0"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        proc.communicate(input=audio_data)
+
+    elif sys.platform.startswith("win"):
+        # Windows: sounddevice + soundfile play MP3 bytes directly from memory
+        try:
+            import io
+            import sounddevice as sd
+            import soundfile as sf
+            audio_io = io.BytesIO(audio_data)
+            data, samplerate = sf.read(audio_io)
+            sd.play(data, samplerate)
+            sd.wait()
+        except ImportError:
+            raise RuntimeError(
+                "Windows in-memory playback requires: pip install sounddevice soundfile"
             )
-        elif sys.platform.startswith("linux"):
-            subprocess.run(
-                ["ffplay", "-nodisp", "-autoexit", temp_path],
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        elif sys.platform.startswith("win"):
-            os.startfile(temp_path)
-            time.sleep(max(1, min(8, len(text) // 10)))
-        else:
-            raise RuntimeError(f"Unsupported platform for audio playback: {sys.platform}")
-    finally:
-        if temp_path and os.path.exists(temp_path):
-            try:
-                os.remove(temp_path)
-            except OSError:
-                pass
+
+    else:
+        raise RuntimeError(f"Unsupported platform for audio playback: {sys.platform}")
 
 
 def tts_worker():
@@ -514,15 +546,22 @@ def _handle_command_response(response: str):
 
 
 # ─────────────────────────────────────────────
-#  VOICE INPUT THREAD
+#  VOICE INPUT THREAD  (FIX: tuned recognizer)
 # ─────────────────────────────────────────────
 def voice_worker():
     recognizer = sr.Recognizer()
     mic = sr.Microphone()
 
+    # FIX: more sensitive settings for reliable wake word detection
+    recognizer.energy_threshold = 300          # lower = picks up quieter speech
+    recognizer.dynamic_energy_threshold = True  # auto-adjusts to live ambient noise
+    recognizer.pause_threshold = 0.6            # shorter pause = faster end-of-speech detection
+
     print(f"[Voice] Wake word: '{WAKE_WORD.upper()}'")
+    print("[Voice] Calibrating microphone for ambient noise (2 seconds)...")
     with mic as source:
-        recognizer.adjust_for_ambient_noise(source, duration=1)
+        recognizer.adjust_for_ambient_noise(source, duration=2)  # FIX: was 1 sec
+    print(f"[Voice] Calibration done. Energy threshold: {recognizer.energy_threshold:.0f}")
 
     while running:
         try:
@@ -572,7 +611,7 @@ def camera_worker():
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
     print("[Camera] Running. Press Q to quit.\n")
-    speak("System ready. Say hello system to give a command.")
+    speak("System ready. Say hey system to give a command.")
 
     while running:
         ret, frame = cap.read()
@@ -661,7 +700,7 @@ def main():
     print("  VISION ASSISTANT  |  Ollama llama3.1  |  YOLOv8 + OCR")
     print("=" * 60)
 
-    # Ollama connectivity check
+    # ── Ollama connectivity check ──
     print("[Check] Pinging Ollama...")
     try:
         requests.get("http://localhost:11434", timeout=3)
@@ -670,6 +709,37 @@ def main():
         print("\n[ERROR] Ollama is not running!")
         print("        Open a NEW terminal and run:  ollama serve")
         print("        Then re-run this script.\n")
+        sys.exit(1)
+
+if USE_ELEVENLABS:
+    print("[Check] Testing ElevenLabs API key...")
+    if not ELEVENLABS_API_KEY:
+        print("[ERROR] ELEVENLABS_API_KEY is not set in your .env file!")
+        sys.exit(1)
+    try:
+        # Test with a minimal TTS call — only needs speech synthesis permission
+        test_resp = requests.post(
+            f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}",
+            headers={
+                "Accept": "audio/mpeg",
+                "Content-Type": "application/json",
+                "xi-api-key": ELEVENLABS_API_KEY,
+            },
+            json={
+                "text": "ok",
+                "model_id": ELEVENLABS_MODEL_ID,
+            },
+            timeout=10,
+        )
+        if test_resp.status_code == 200:
+            print("[Check] ElevenLabs connected ✓")
+        elif test_resp.status_code == 401:
+            print(f"[ERROR] ElevenLabs rejected key: {test_resp.text}")
+            sys.exit(1)
+        else:
+            print(f"[WARN] ElevenLabs status {test_resp.status_code}: {test_resp.text}")
+    except Exception as e:
+        print(f"[ERROR] ElevenLabs unreachable: {e}")
         sys.exit(1)
 
     threads = []
