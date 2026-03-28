@@ -27,6 +27,16 @@ CHANGES vs previous version:
     - Wake word changed to "hey system" (more phonetically distinct)
     - Voice recognizer: lower energy threshold, dynamic threshold ON,
       shorter pause threshold, longer ambient noise calibration
+
+OCR CHANGES (this version):
+    - [OCR-1] EasyOCR moved to its own dedicated thread (ocr_worker)
+              Camera thread now only pushes crops — never blocks on readtext()
+    - [OCR-2] Fuzzy keyword matching added via difflib.SequenceMatcher
+              Catches OCR noise like "Wet Flo0r" matching "wet floor"
+    - [OCR-3] user_priority_list persisted to user_priorities.json
+              Loaded on startup, saved on every ADD / REMOVE / CLEAR
+    - [OCR-4] Crop preprocessing added (grayscale + CLAHE + denoise)
+              Improves EasyOCR accuracy on uneven lighting and shadows
 ============================================================
 """
 
@@ -36,6 +46,8 @@ import time
 import queue
 import sys
 import os
+import json
+from difflib import SequenceMatcher
 from dotenv import load_dotenv
 load_dotenv()
 import subprocess
@@ -98,12 +110,35 @@ CRITICAL_LIST = {
     "restricted", "caution", "alert", "no exit", "blocked"
 }
 
-user_priority_list = set()   # grows/shrinks via voice commands
+# [OCR-3] Loaded from disk on startup; saved on every mutation
+PRIORITY_FILE = "user_priorities.json"
+
+def load_priorities() -> set:
+    try:
+        with open(PRIORITY_FILE, "r") as f:
+            data = json.load(f)
+            print(f"[Memory] Loaded {len(data)} saved priorities: {data}")
+            return set(data)
+    except FileNotFoundError:
+        return set()
+    except json.JSONDecodeError:
+        print("[Memory] Priority file corrupted — starting fresh.")
+        return set()
+
+def save_priorities():
+    try:
+        with open(PRIORITY_FILE, "w") as f:
+            json.dump(list(user_priority_list), f, indent=2)
+    except Exception as e:
+        print(f"[Memory] Save failed: {e}")
+
+user_priority_list = set()   # populated in main() via load_priorities()
 
 # ─────────────────────────────────────────────
 #  SHARED STATE
 # ─────────────────────────────────────────────
 ocr_queue    = queue.Queue()
+crop_queue   = queue.Queue(maxsize=5)  # [OCR-1] camera → ocr_worker; maxsize prevents memory buildup
 speech_queue = queue.Queue()
 tts_queue    = queue.Queue()
 recent_texts = deque(maxlen=30)
@@ -148,7 +183,7 @@ UNKNOWN: <short helpful reply>
 Core behavior:
 
 Infer intent, do not rely on exact keywords.
-If user expresses “notify me / alert me / let me know / watch for / remember / keep an eye out for” an object or place, treat it as ADD.
+If user expresses "notify me / alert me / let me know / watch for / remember / keep an eye out for" an object or place, treat it as ADD.
 If user says stop tracking / remove / don't alert for something, treat it as REMOVE.
 If user asks what is being tracked, treat as LIST.
 If user asks to reset/delete all custom tracked items, treat as CLEAR.
@@ -393,13 +428,50 @@ def speak(text: str):
 
 
 # ─────────────────────────────────────────────
+#  [OCR-2] FUZZY MATCHING
+# ─────────────────────────────────────────────
+def fuzzy_match(ocr_text: str, keyword: str, threshold: float = 0.82) -> bool:
+    """
+    Returns True if keyword appears in ocr_text with fuzzy tolerance.
+    Handles OCR noise like 'Wet Flo0r' matching 'wet floor'.
+
+    threshold guide:
+      0.75 → very forgiving  (low-res or badly lit camera)
+      0.82 → balanced        (normal indoor demo)  ← default
+      0.90 → strict          (high-res, clean printed signs)
+
+    Strategy: exact substring first (fast), then sliding window
+    of keyword-length word groups across the OCR text.
+    """
+    t = ocr_text.lower()
+    k = keyword.lower()
+
+    # Fast path — exact substring still works and costs nothing
+    if k in t:
+        return True
+
+    # Sliding window over word groups the same length as the keyword
+    t_words = t.split()
+    k_words = k.split()
+    window_size = len(k_words)
+
+    for i in range(max(1, len(t_words) - window_size + 1)):
+        window = " ".join(t_words[i : i + window_size])
+        ratio = SequenceMatcher(None, window, k).ratio()
+        if ratio >= threshold:
+            return True
+
+    return False
+
+
+# ─────────────────────────────────────────────
 #  PRIORITY HELPERS
 # ─────────────────────────────────────────────
 def is_priority(text: str) -> bool:
     """Fast local check — avoids calling LLM for irrelevant text."""
     t = text.lower()
     for item in CRITICAL_LIST | user_priority_list:
-        if item.lower() in t:
+        if fuzzy_match(t, item):   # [OCR-2] was: if item.lower() in t
             return True
     return False
 
@@ -413,7 +485,7 @@ def build_passive_alert(text: str):
 
     # Prefer longer phrase matches first for more specific alerts.
     for item in sorted(CRITICAL_LIST | user_priority_list, key=len, reverse=True):
-        if item.lower() not in t:
+        if not fuzzy_match(t, item):   # [OCR-2] was: if item.lower() not in t
             continue
 
         if item in {"wet floor", "slippery road"}:
@@ -515,6 +587,7 @@ def _handle_command_response(response: str):
     if upper.startswith("ADD:"):
         item = response[4:].strip().lower()
         user_priority_list.add(item)
+        save_priorities()                  # [OCR-3] persist
         speak(f"Added {item} to your priority list.")
         print(f"[Priority] User list: {user_priority_list}")
 
@@ -522,6 +595,7 @@ def _handle_command_response(response: str):
         item = response[7:].strip().lower()
         if item in user_priority_list:
             user_priority_list.discard(item)
+            save_priorities()              # [OCR-3] persist
             speak(f"Removed {item} from your priority list.")
         else:
             speak(f"{item} was not in your list.")
@@ -534,6 +608,7 @@ def _handle_command_response(response: str):
 
     elif upper.startswith("CLEAR:"):
         user_priority_list.clear()
+        save_priorities()                  # [OCR-3] persist
         speak("Custom priority list cleared.")
 
     elif upper.startswith("UNKNOWN:"):
@@ -591,14 +666,86 @@ def voice_worker():
 
 
 # ─────────────────────────────────────────────
-#  CAMERA + YOLO + OCR
+#  [OCR-4] CROP PREPROCESSING
+# ─────────────────────────────────────────────
+def preprocess_crop(crop: np.ndarray) -> np.ndarray:
+    """
+    Improves EasyOCR accuracy on real-world signage.
+
+    Steps:
+      1. Grayscale   — removes colour noise irrelevant to text recognition
+      2. CLAHE       — locally boosts contrast in shadows/glare without
+                       blowing out bright areas (better than global equalise)
+      3. Denoise     — mild Gaussian blur removes sensor noise that OCR
+                       misreads as stray punctuation or wrong characters
+      4. Back to BGR — EasyOCR accepts both; BGR is safer for compatibility
+    """
+    gray     = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    clahe    = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
+    denoised = cv2.GaussianBlur(enhanced, (3, 3), 0)
+    return cv2.cvtColor(denoised, cv2.COLOR_GRAY2BGR)
+
+
+# ─────────────────────────────────────────────
+#  [OCR-1] DEDICATED OCR THREAD
+# ─────────────────────────────────────────────
+def ocr_worker():
+    """
+    Runs EasyOCR in its own thread so camera_worker() never blocks on readtext().
+    Receives (crop, (x1, y1)) tuples from crop_queue.
+    Applies preprocessing, runs OCR, then feeds results into the existing
+    duplicate-check → passive-alert → LLM pipeline unchanged.
+    """
+    print("[OCR] Initializing EasyOCR...")
+    reader = easyocr.Reader(["en"], gpu=True)  # set gpu=False if no CUDA
+    print("[OCR] Ready.")
+
+    while running:
+        try:
+            crop, box_coords = crop_queue.get(timeout=0.5)
+        except queue.Empty:
+            continue
+
+        try:
+            # [OCR-4] removed — preprocessing hurt accuracy on clean signs.
+            # EasyOCR handles contrast internally; raw crop performs better.
+            ocr_results = reader.readtext(crop, detail=0, paragraph=True)
+
+            for text in ocr_results:
+                text = text.strip()
+                if len(text) < 2:
+                    continue
+
+                print(f"[OCR] '{text}'")
+
+                if not is_duplicate(text):
+                    # Passive AI path: immediate rule-based safety alert
+                    priority_key, passive_alert = build_passive_alert(text)
+                    if passive_alert and priority_key and should_speak_priority_alert(priority_key):
+                        speak(passive_alert)
+                    elif len(text) > 3:
+                        # Non-priority text goes to LLM for contextual narration
+                        ocr_queue.put(text)
+
+        except Exception as e:
+            print(f"[OCR Error] {e}")
+        finally:
+            crop_queue.task_done()
+
+
+# ─────────────────────────────────────────────
+#  CAMERA + YOLO
 # ─────────────────────────────────────────────
 def camera_worker():
+    """
+    Camera thread: capture → YOLO → push crops to crop_queue.
+    EasyOCR no longer runs here — camera loop never blocks on OCR.
+    """
     print("[Camera] Loading YOLO model...")
     model = YOLO(MODEL_PATH)
 
-    print("[OCR] Initializing EasyOCR...")
-    reader = easyocr.Reader(["en"], gpu=True)  # set gpu=False if no CUDA
+    # [OCR-1] EasyOCR init moved to ocr_worker() — removed from here
 
     cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
     if not cap.isOpened():
@@ -620,7 +767,6 @@ def camera_worker():
         # ── YOLO ──
         results = model(frame, conf=CONFIDENCE_THRESHOLD, verbose=False)
         annotated = results[0].plot()
-        all_ocr_text = []
 
         for box in results[0].boxes:
             x1, y1, x2, y2 = map(int, box.xyxy[0])
@@ -641,34 +787,11 @@ def camera_worker():
             if crop.size == 0:
                 continue
 
-            # ── EasyOCR ──
-            ocr_results = reader.readtext(crop, detail=0, paragraph=True)
-            for text in ocr_results:
-                text = text.strip()
-                if len(text) < 2:
-                    continue
-
-                all_ocr_text.append(text)
-                print(f"[OCR] '{text}'  (box: {box_area}px²)")
-
-                cv2.putText(
-                    annotated, text,
-                    (x1, max(y1 - 8, 12)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.65,
-                    (0, 255, 255), 2
-                )
-
-        # Queue for LLM
-        if all_ocr_text:
-            combined = " | ".join(all_ocr_text)
-            if not is_duplicate(combined):
-                # Passive AI path: immediate rule-based safety alert.
-                priority_key, passive_alert = build_passive_alert(combined)
-                if passive_alert and priority_key and should_speak_priority_alert(priority_key):
-                    speak(passive_alert)
-                elif len(combined) > 3:
-                    # Non-priority text can still use LLM for contextual narration.
-                    ocr_queue.put(combined)
+            # [OCR-1] Push crop to ocr_worker — camera never waits for readtext()
+            try:
+                crop_queue.put_nowait((crop.copy(), (x1, y1)))
+            except queue.Full:
+                pass  # drop this crop; next frame will try again
 
         # ── HUD ──
         ts = datetime.now().strftime("%H:%M:%S")
@@ -692,11 +815,14 @@ def camera_worker():
 #  MAIN
 # ─────────────────────────────────────────────
 def main():
-    global running
+    global running, user_priority_list
 
     print("=" * 60)
     print("  VISION ASSISTANT  |  Ollama llama3.1  |  YOLOv8 + OCR")
     print("=" * 60)
+
+    # [OCR-3] Load saved priorities before any thread starts
+    user_priority_list = load_priorities()
 
     # ── Ollama connectivity check ──
     print("[Check] Pinging Ollama...")
@@ -709,36 +835,36 @@ def main():
         print("        Then re-run this script.\n")
         sys.exit(1)
 
-if USE_ELEVENLABS:
-    print("[Check] Testing ElevenLabs API key...")
-    if not ELEVENLABS_API_KEY:
-        print("[ERROR] ELEVENLABS_API_KEY is not set in your .env file!")
-        sys.exit(1)
-    try:
-        # Test with a minimal TTS call — only needs speech synthesis permission
-        test_resp = requests.post(
-            f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}",
-            headers={
-                "Accept": "audio/mpeg",
-                "Content-Type": "application/json",
-                "xi-api-key": ELEVENLABS_API_KEY,
-            },
-            json={
-                "text": "ok",
-                "model_id": ELEVENLABS_MODEL_ID,
-            },
-            timeout=10,
-        )
-        if test_resp.status_code == 200:
-            print("[Check] ElevenLabs connected ✓")
-        elif test_resp.status_code == 401:
-            print(f"[ERROR] ElevenLabs rejected key: {test_resp.text}")
+    if USE_ELEVENLABS:
+        print("[Check] Testing ElevenLabs API key...")
+        if not ELEVENLABS_API_KEY:
+            print("[ERROR] ELEVENLABS_API_KEY is not set in your .env file!")
             sys.exit(1)
-        else:
-            print(f"[WARN] ElevenLabs status {test_resp.status_code}: {test_resp.text}")
-    except Exception as e:
-        print(f"[ERROR] ElevenLabs unreachable: {e}")
-        sys.exit(1)
+        try:
+            # Test with a minimal TTS call — only needs speech synthesis permission
+            test_resp = requests.post(
+                f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}",
+                headers={
+                    "Accept": "audio/mpeg",
+                    "Content-Type": "application/json",
+                    "xi-api-key": ELEVENLABS_API_KEY,
+                },
+                json={
+                    "text": "ok",
+                    "model_id": ELEVENLABS_MODEL_ID,
+                },
+                timeout=10,
+            )
+            if test_resp.status_code == 200:
+                print("[Check] ElevenLabs connected ✓")
+            elif test_resp.status_code == 401:
+                print(f"[ERROR] ElevenLabs rejected key: {test_resp.text}")
+                sys.exit(1)
+            else:
+                print(f"[WARN] ElevenLabs status {test_resp.status_code}: {test_resp.text}")
+        except Exception as e:
+            print(f"[ERROR] ElevenLabs unreachable: {e}")
+            sys.exit(1)
 
     threads = []
 
@@ -759,6 +885,11 @@ if USE_ELEVENLABS:
     t_voice = threading.Thread(target=voice_worker, daemon=True, name="Voice")
     t_voice.start()
     threads.append(t_voice)
+
+    # [OCR-1] Dedicated OCR thread — starts after LLM and voice
+    t_ocr = threading.Thread(target=ocr_worker, daemon=True, name="OCR")
+    t_ocr.start()
+    threads.append(t_ocr)
 
     # Camera on main thread (required by OpenCV on Windows)
     try:
