@@ -15,9 +15,9 @@ Recognizer tuning:
 
 import time
 import speech_recognition as sr
-import state
-from config import WAKE_WORD
-from tts import speak
+from . import state
+from .config import WAKE_WORD
+from .tts import speak
 
 
 def voice_worker():

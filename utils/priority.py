@@ -10,8 +10,8 @@ Responsibilities:
 """
 
 import time
-import state
-from config import OCR_COOLDOWN_SEC, PRIORITY_REPEAT_COOLDOWN_SEC
+from . import state
+from .config import OCR_COOLDOWN_SEC, PRIORITY_REPEAT_COOLDOWN_SEC
 
 # ── Hardcoded safety terms ─────────────────────────────────
 CRITICAL_LIST: set = {

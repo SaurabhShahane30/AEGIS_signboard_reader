@@ -13,8 +13,8 @@ import sys
 import subprocess
 import requests
 import pyttsx3
-import state
-from config import (
+from . import state
+from .config import (
     USE_ELEVENLABS, ELEVENLABS_API_KEY, ELEVENLABS_VOICE_ID,
     ELEVENLABS_MODEL_ID, TTS_HTTP_TIMEOUT_SEC,
     TARGET_LANGUAGE, SOURCE_LANGUAGE,

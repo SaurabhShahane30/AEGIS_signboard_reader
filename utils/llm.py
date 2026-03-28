@@ -9,10 +9,10 @@ Responsibilities:
 
 import time
 import requests
-import state
-from config import OLLAMA_URL, OLLAMA_MODEL, LLM_RATE_LIMIT_SEC
-from priority import priority_context
-from tts import speak
+from . import state
+from .config import OLLAMA_URL, OLLAMA_MODEL, LLM_RATE_LIMIT_SEC
+from .priority import priority_context
+from .tts import speak
 
 # ── System Prompt ──────────────────────────────────────────
 SYSTEM_PROMPT = """You are a vision assistant operating within a real-time camera system.

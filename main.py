@@ -23,13 +23,12 @@ import time
 import threading
 import requests
 
-import state
-from config import USE_ELEVENLABS, ELEVENLABS_API_KEY, ELEVENLABS_VOICE_ID, ELEVENLABS_MODEL_ID
-from tts import tts_worker, speak
-from llm import llm_worker
-from voice import voice_worker
-from camera import camera_worker
-
+from utils import state
+from utils.config import USE_ELEVENLABS, ELEVENLABS_API_KEY, ELEVENLABS_VOICE_ID, ELEVENLABS_MODEL_ID
+from utils.tts import tts_worker, speak
+from utils.llm import llm_worker
+from utils.voice import voice_worker
+from utils.camera import camera_worker
 
 # ── Pre-flight checks ──────────────────────────────────────
 
