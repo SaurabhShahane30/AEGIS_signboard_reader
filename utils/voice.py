@@ -64,11 +64,11 @@ def voice_worker():
             
             # ── Intercept "end session" — never send to LLM ──
             if any(phrase in command for phrase in END_SESSION_PHRASES):
-                speak("Session ended. Goodbye.")
+                speak("Session ended. Starting a new session.")
                 log_event("command", "end session")
                 end_session(reason="user_command")
-                state.running = False
-                return
+                # system keeps running; end_session() starts a fresh session
+                continue
  
             state.speech_queue.put(command)
 

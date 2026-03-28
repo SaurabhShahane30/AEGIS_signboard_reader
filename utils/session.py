@@ -14,7 +14,7 @@ Session file schema:
   "started_at":    "2025-03-28T14:32:01.123456",
   "ended_at":      "2025-03-28T14:58:44.001234",   # null if crashed
   "end_reason":    "user_command" | "process_exit" | "crashed",
-  "priority_list": ["pharmacy", "wet floor"],       # snapshot at session end
+  "priority_list": [],       # snapshot at session end
   "events": [
     {
       "time":  "2025-03-28T14:32:15.001234",
@@ -30,7 +30,7 @@ import json
 import os
 from datetime import datetime
 
-import state
+from . import state
 
 SESSIONS_DIR = "sessions"
 
@@ -88,10 +88,11 @@ def start_session():
 
 def end_session(reason: str = "user_command"):
     """
-    Close the current session gracefully.
-    - Snapshots user_priority_list into the JSON (this session only).
-    - Writes ended_at and end_reason.
-    - Sets state.session_active = False.
+    Close the current session and immediately start a fresh one (unless shutting down).
+
+    - Snapshots user_priority_list into the old session JSON.
+    - Clears user_priority_list (no bleed-over).
+    - When reason is "process_exit" a new session is NOT started (app is shutting down).
 
     reason: "user_command" | "process_exit" | "crashed"
     """
@@ -106,6 +107,10 @@ def end_session(reason: str = "user_command"):
 
     _save(data)
     print(f"[Session] Ended ({reason}) → sessions/{data['session_id']}.json")
+
+    # Keep the system alive — start a new clean session unless we're shutting down
+    if reason != "process_exit":
+        start_session()
 
 
 def log_event(event_type: str, detail: str):

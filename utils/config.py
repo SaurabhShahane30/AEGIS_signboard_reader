@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── Model & Camera ─────────────────────────────────────────
-MODEL_PATH           = "../signboard_project/best_yolov8s.pt"
+MODEL_PATH           = "./signboard_project/best_yolov8s.pt"
 CAMERA_INDEX         = 0
 CONFIDENCE_THRESHOLD = 0.5
 MIN_BOX_AREA         = 3000          # px² — ignore tiny/noisy detections
@@ -17,8 +17,9 @@ MIN_BOX_AREA         = 3000          # px² — ignore tiny/noisy detections
 WAKE_WORD            = "hey system"
 
 # ── OCR / LLM Rate Limiting ────────────────────────────────
-OCR_COOLDOWN_SEC     = 4
-LLM_RATE_LIMIT_SEC   = 2
+OCR_COOLDOWN_SEC      = 30   # seconds before same OCR text can re-enter pipeline
+LLM_RATE_LIMIT_SEC    = 2    # minimum gap between LLM calls
+LLM_ALERT_COOLDOWN_SEC = 30  # seconds before same LLM alert can be spoken again
 
 # ── Ollama ─────────────────────────────────────────────────
 OLLAMA_URL           = "http://localhost:11434/api/generate"

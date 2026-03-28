@@ -37,6 +37,20 @@ OCR CHANGES (this version):
               Loaded on startup, saved on every ADD / REMOVE / CLEAR
     - [OCR-4] Crop preprocessing added (grayscale + CLAHE + denoise)
               Improves EasyOCR accuracy on uneven lighting and shadows
+
+DIRECTION CHANGES (this version):
+    - [DIR-1] get_direction() computes relative sign position
+              (left / ahead-left / ahead / ahead-right / right)
+              using box center vs frame width, with span-overlap blending
+    - [DIR-2] alert_snapshot_dir created at startup (alert_snapshots/)
+    - [DIR-3] save_alert_snapshot() saves the full annotated frame
+              with the detected sign box highlighted and a label
+              stamped on it; filename encodes timestamp + sign text
+    - [DIR-4] crop_queue now carries (crop, (x1,y1,x2,y2), frame_ref)
+              so ocr_worker has the full box and latest annotated frame
+    - [DIR-5] Passive alerts and LLM alerts both append direction string
+    - [DIR-6] LLM prompt extended with direction context so the model
+              can include direction in its natural language response
 ============================================================
 """
 
@@ -63,6 +77,10 @@ try:
     from googletrans import Translator
 except Exception:
     Translator = None
+
+import PIL.Image
+if not hasattr(PIL.Image, "ANTIALIAS"):
+    PIL.Image.ANTIALIAS = PIL.Image.LANCZOS
 
 # ── PyTorch 2.6 fix (must be before YOLO import) ───────────
 import torch
@@ -99,6 +117,9 @@ ELEVENLABS_VOICE_ID  = os.getenv("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")
 ELEVENLABS_MODEL_ID  = "eleven_multilingual_v2"
 TTS_HTTP_TIMEOUT_SEC = 12
 PRIORITY_REPEAT_COOLDOWN_SEC = 12  # suppress repeating same priority alert too often
+
+# [DIR-2] Snapshot output directory
+ALERT_SNAPSHOT_DIR   = "alert_snapshots"
 
 # ─────────────────────────────────────────────
 #  PRIORITY LISTS
@@ -138,7 +159,8 @@ user_priority_list = set()   # populated in main() via load_priorities()
 #  SHARED STATE
 # ─────────────────────────────────────────────
 ocr_queue    = queue.Queue()
-crop_queue   = queue.Queue(maxsize=5)  # [OCR-1] camera → ocr_worker; maxsize prevents memory buildup
+# [DIR-4] crop_queue items are now (crop, (x1,y1,x2,y2), annotated_frame)
+crop_queue   = queue.Queue(maxsize=5)
 speech_queue = queue.Queue()
 tts_queue    = queue.Queue()
 recent_texts = deque(maxlen=30)
@@ -148,6 +170,159 @@ running      = True
 translation_cache = {}
 translator_instance = None
 last_priority_alert_times = {}
+
+# [DIR-4] Rolling frame buffer — camera writes, OCR/LLM reads
+# Stores (timestamp, annotated_frame) tuples; maxlen caps memory use
+frame_buffer = deque(maxlen=30)
+
+# ─────────────────────────────────────────────
+#  [DIR-1] DIRECTION DETECTION
+# ─────────────────────────────────────────────
+# The frame is divided into three horizontal thirds:
+#   left zone   : box_center_ratio < 0.33
+#   ahead zone  : 0.33 <= box_center_ratio <= 0.66
+#   right zone  : box_center_ratio > 0.66
+#
+# If the box *spans* two zones (e.g. center is right but left edge
+# reaches into the ahead zone), we report a blended direction.
+
+def get_direction(x1: int, x2: int, frame_width: int) -> str:
+    """
+    Compute the relative direction of a detected sign.
+
+    Parameters
+    ----------
+    x1, x2      : bounding box left and right pixel x-coordinates
+    frame_width : width of the full camera frame in pixels
+
+    Returns
+    -------
+    One of: "to your left" | "ahead and to your left" | "straight ahead"
+            | "ahead and to your right" | "to your right"
+    """
+    if frame_width <= 0:
+        return "straight ahead"
+
+    center_ratio = ((x1 + x2) / 2) / frame_width
+    left_ratio   = x1 / frame_width
+    right_ratio  = x2 / frame_width
+
+    LEFT_THRESH  = 0.33
+    RIGHT_THRESH = 0.66
+
+    # Determine which zone(s) the box occupies
+    in_left   = left_ratio  < LEFT_THRESH
+    in_right  = right_ratio > RIGHT_THRESH
+    in_center = center_ratio >= LEFT_THRESH and center_ratio <= RIGHT_THRESH
+
+    if in_left and in_right:
+        # Rare: box spans the whole frame
+        return "straight ahead"
+
+    if in_left and in_center:
+        return "ahead and to your left"
+
+    if in_right and in_center:
+        return "ahead and to your right"
+
+    if center_ratio < LEFT_THRESH:
+        return "to your left"
+
+    if center_ratio > RIGHT_THRESH:
+        return "to your right"
+
+    return "straight ahead"
+
+
+# ─────────────────────────────────────────────
+#  [DIR-3] ALERT SNAPSHOT SAVER
+# ─────────────────────────────────────────────
+def save_alert_snapshot(
+    annotated_frame: np.ndarray,
+    box: tuple,
+    sign_text: str,
+    direction: str,
+) -> str | None:
+    """
+    Save a full annotated camera frame to disk when an alert fires.
+
+    The sign bounding box is drawn with a bright highlight rect and a
+    label strip so the snapshot is self-documenting.  The filename
+    encodes the timestamp and a sanitised form of the sign text so
+    alert_snapshots/ can be reviewed chronologically.
+
+    Parameters
+    ----------
+    annotated_frame : full frame already annotated by YOLO (numpy BGR)
+    box             : (x1, y1, x2, y2) of the detected sign
+    sign_text       : OCR text that triggered the alert
+    direction       : direction string from get_direction()
+
+    Returns
+    -------
+    Saved filepath string, or None on failure.
+    """
+    try:
+        os.makedirs(ALERT_SNAPSHOT_DIR, exist_ok=True)
+
+        frame = annotated_frame.copy()
+        x1, y1, x2, y2 = box
+        h, w = frame.shape[:2]
+
+        # ── Draw highlight box ──────────────────────────────────────
+        # Thick cyan outer rect (visible over YOLO's default colours)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 3)
+
+        # Draw the frame's vertical midline as a thin reference line
+        mid_x = w // 2
+        cv2.line(frame, (mid_x, 0), (mid_x, h), (200, 200, 200), 1, cv2.LINE_AA)
+
+        # ── Label strip above the box ───────────────────────────────
+        label = f"{sign_text}  |  {direction}"
+        font       = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.65
+        thickness  = 2
+        (tw, th), baseline = cv2.getTextSize(label, font, font_scale, thickness)
+
+        strip_y1 = max(0, y1 - th - baseline - 8)
+        strip_y2 = max(th + baseline + 8, y1)
+        strip_x2 = min(w, x1 + tw + 10)
+
+        # Dark semi-transparent background for the label
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (x1, strip_y1), (strip_x2, strip_y2), (30, 30, 30), -1)
+        cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
+
+        cv2.putText(
+            frame, label,
+            (x1 + 5, strip_y2 - baseline - 2),
+            font, font_scale,
+            (0, 255, 255), thickness, cv2.LINE_AA,
+        )
+
+        # ── Timestamp watermark (bottom-left) ──────────────────────
+        ts = datetime.now().strftime("%Y-%m-%d  %H:%M:%S")
+        cv2.putText(
+            frame, ts,
+            (10, h - 12),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+            (180, 180, 180), 1, cv2.LINE_AA,
+        )
+
+        # ── Save ────────────────────────────────────────────────────
+        safe_text = "".join(c if c.isalnum() or c in "_ " else "_" for c in sign_text)
+        safe_text = safe_text.replace(" ", "_")[:30]
+        filename  = f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{safe_text}.jpg"
+        filepath  = os.path.join(ALERT_SNAPSHOT_DIR, filename)
+
+        cv2.imwrite(filepath, frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
+        print(f"[Snapshot] Saved: {filepath}")
+        return filepath
+
+    except Exception as e:
+        print(f"[Snapshot Error] {e}")
+        return None
+
 
 # ─────────────────────────────────────────────
 #  OLLAMA CALLER
@@ -165,7 +340,12 @@ Alert style:
 Use calm, friendly, human-like phrasing
 Avoid rigid or robotic wording
 Do not use prefixes like "ALERT:"
-Keep under 15 words
+Keep under 20 words
+If a direction is provided, naturally include it (e.g. "Pharmacy detected to your left.")
+- Output ONLY the final alert sentence.
+- Example:
+  Input: pharmacy
+  Output: Pharmacy detected to your right.
 
 ROLE 2 — INTENT PARSER FOR PRIORITY MEMORY:
 
@@ -323,7 +503,6 @@ def speak_with_elevenlabs(text: str):
     if not ELEVENLABS_API_KEY:
         raise RuntimeError("ELEVENLABS_API_KEY is not set")
 
-    # Use /stream endpoint instead of plain /text-to-speech
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}/stream"
     headers = {
         "Accept": "audio/mpeg",
@@ -341,11 +520,9 @@ def speak_with_elevenlabs(text: str):
     )
     resp.raise_for_status()
 
-    # Collect all audio bytes in memory — no file written to disk
     audio_data = b"".join(resp.iter_content(chunk_size=4096))
 
     if sys.platform == "darwin":
-        # macOS: afplay supports reading from stdin
         proc = subprocess.Popen(
             ["afplay", "-"],
             stdin=subprocess.PIPE,
@@ -355,7 +532,6 @@ def speak_with_elevenlabs(text: str):
         proc.communicate(input=audio_data)
 
     elif sys.platform.startswith("linux"):
-        # Linux: ffplay reads from pipe:0
         proc = subprocess.Popen(
             ["ffplay", "-nodisp", "-autoexit", "-i", "pipe:0"],
             stdin=subprocess.PIPE,
@@ -365,7 +541,6 @@ def speak_with_elevenlabs(text: str):
         proc.communicate(input=audio_data)
 
     elif sys.platform.startswith("win"):
-        # Windows: sounddevice + soundfile play MP3 bytes directly from memory
         try:
             import io
             import sounddevice as sd
@@ -392,7 +567,6 @@ def tts_worker():
         try:
             text = tts_queue.get(timeout=0.5)
 
-            # Translation is intentionally done only at final speech output stage.
             final_text = translate_for_speech(text)
             print(f"\n🔊 {final_text}")
 
@@ -434,23 +608,13 @@ def fuzzy_match(ocr_text: str, keyword: str, threshold: float = 0.82) -> bool:
     """
     Returns True if keyword appears in ocr_text with fuzzy tolerance.
     Handles OCR noise like 'Wet Flo0r' matching 'wet floor'.
-
-    threshold guide:
-      0.75 → very forgiving  (low-res or badly lit camera)
-      0.82 → balanced        (normal indoor demo)  ← default
-      0.90 → strict          (high-res, clean printed signs)
-
-    Strategy: exact substring first (fast), then sliding window
-    of keyword-length word groups across the OCR text.
     """
     t = ocr_text.lower()
     k = keyword.lower()
 
-    # Fast path — exact substring still works and costs nothing
     if k in t:
         return True
 
-    # Sliding window over word groups the same length as the keyword
     t_words = t.split()
     k_words = k.split()
     window_size = len(k_words)
@@ -471,31 +635,39 @@ def is_priority(text: str) -> bool:
     """Fast local check — avoids calling LLM for irrelevant text."""
     t = text.lower()
     for item in CRITICAL_LIST | user_priority_list:
-        if fuzzy_match(t, item):   # [OCR-2] was: if item.lower() in t
+        if fuzzy_match(t, item):
             return True
     return False
 
 
-def build_passive_alert(text: str):
-    """Create immediate local alert for critical/custom priority matches.
+def build_passive_alert(text: str, direction: str = "straight ahead"):
+    """
+    Create immediate local alert for critical/custom priority matches.
+
+    [DIR-5] direction is appended to every alert message so the user
+    knows which way to look without waiting for the LLM.
 
     Returns a tuple: (priority_key, alert_message) or (None, None).
     """
     t = text.lower()
 
-    # Prefer longer phrase matches first for more specific alerts.
     for item in sorted(CRITICAL_LIST | user_priority_list, key=len, reverse=True):
-        if not fuzzy_match(t, item):   # [OCR-2] was: if item.lower() not in t
+        if not fuzzy_match(t, item):
             continue
 
-        if item in {"wet floor", "slippery road"}:
-            return item, "Warning. Slippery surface ahead."
-        if item in {"fire", "explosive", "high voltage"}:
-            return item, f"Danger. {item} nearby."
-        if item in {"no entry", "do not enter", "keep out", "restricted"}:
-            return item, "Warning. Restricted area ahead."
+        # Build the directional suffix
+        # "straight ahead" is the neutral case — still worth saying
+        dir_phrase = direction  # e.g. "to your left", "straight ahead"
 
-        return item, f"Warning. {item} ahead."
+        if item in {"wet floor", "slippery road"}:
+            return item, f"Warning. Slippery surface {dir_phrase}."
+        if item in {"fire", "explosive", "high voltage"}:
+            return item, f"Danger. {item} {dir_phrase}."
+        if item in {"no entry", "do not enter", "keep out", "restricted"}:
+            return item, f"Warning. Restricted area {dir_phrase}."
+
+        # Generic: e.g. "Pharmacy detected to your left."
+        return item, f"{item.capitalize()} detected, {dir_phrase}."
 
     return None, None
 
@@ -554,8 +726,16 @@ def llm_worker():
             pass
 
         # OCR alerts
+        # [DIR-6] ocr_queue items now carry (text, direction) tuples
         try:
-            ocr_text = ocr_queue.get(timeout=0.3)
+            item = ocr_queue.get(timeout=0.3)
+
+            # Backwards compat: plain string or (text, direction) tuple
+            if isinstance(item, tuple):
+                ocr_text, direction = item
+            else:
+                ocr_text, direction = item, "straight ahead"
+
             now = time.time()
 
             if (now - last_llm_call) < LLM_RATE_LIMIT_SEC:
@@ -563,16 +743,19 @@ def llm_worker():
                 continue
 
             last_llm_call = now
+
+            # [DIR-6] Include direction in the prompt so the LLM can use it
             prompt = (
                 f'OCR TEXT from camera: "{ocr_text}"\n'
+                f'Sign direction: {direction}\n'
                 f"{priority_context()}\n"
-                f"Should I alert the user?"
+                f"Should I alert the user? If yes, include the direction naturally in your response."
             )
             response = call_ollama(prompt)
             print(f"[LLM -> OCR] {response}")
 
-            if response.upper().startswith("ALERT:"):
-                speak(response[6:].strip())
+            if response and response != "IGNORE":
+                speak(response.strip())
 
             ocr_queue.task_done()
 
@@ -587,7 +770,7 @@ def _handle_command_response(response: str):
     if upper.startswith("ADD:"):
         item = response[4:].strip().lower()
         user_priority_list.add(item)
-        save_priorities()                  # [OCR-3] persist
+        save_priorities()
         speak(f"Added {item} to your priority list.")
         print(f"[Priority] User list: {user_priority_list}")
 
@@ -595,7 +778,7 @@ def _handle_command_response(response: str):
         item = response[7:].strip().lower()
         if item in user_priority_list:
             user_priority_list.discard(item)
-            save_priorities()              # [OCR-3] persist
+            save_priorities()
             speak(f"Removed {item} from your priority list.")
         else:
             speak(f"{item} was not in your list.")
@@ -608,7 +791,7 @@ def _handle_command_response(response: str):
 
     elif upper.startswith("CLEAR:"):
         user_priority_list.clear()
-        save_priorities()                  # [OCR-3] persist
+        save_priorities()
         speak("Custom priority list cleared.")
 
     elif upper.startswith("UNKNOWN:"):
@@ -619,21 +802,20 @@ def _handle_command_response(response: str):
 
 
 # ─────────────────────────────────────────────
-#  VOICE INPUT THREAD  (FIX: tuned recognizer)
+#  VOICE INPUT THREAD
 # ─────────────────────────────────────────────
 def voice_worker():
     recognizer = sr.Recognizer()
     mic = sr.Microphone()
 
-    # FIX: more sensitive settings for reliable wake word detection
-    recognizer.energy_threshold = 300          # lower = picks up quieter speech
-    recognizer.dynamic_energy_threshold = True  # auto-adjusts to live ambient noise
-    recognizer.pause_threshold = 0.6            # shorter pause = faster end-of-speech detection
+    recognizer.energy_threshold = 300
+    recognizer.dynamic_energy_threshold = True
+    recognizer.pause_threshold = 0.6
 
     print(f"[Voice] Wake word: '{WAKE_WORD.upper()}'")
     print("[Voice] Calibrating microphone for ambient noise (2 seconds)...")
     with mic as source:
-        recognizer.adjust_for_ambient_noise(source, duration=2)  # FIX: was 1 sec
+        recognizer.adjust_for_ambient_noise(source, duration=2)
     print(f"[Voice] Calibration done. Energy threshold: {recognizer.energy_threshold:.0f}")
 
     while running:
@@ -669,17 +851,6 @@ def voice_worker():
 #  [OCR-4] CROP PREPROCESSING
 # ─────────────────────────────────────────────
 def preprocess_crop(crop: np.ndarray) -> np.ndarray:
-    """
-    Improves EasyOCR accuracy on real-world signage.
-
-    Steps:
-      1. Grayscale   — removes colour noise irrelevant to text recognition
-      2. CLAHE       — locally boosts contrast in shadows/glare without
-                       blowing out bright areas (better than global equalise)
-      3. Denoise     — mild Gaussian blur removes sensor noise that OCR
-                       misreads as stray punctuation or wrong characters
-      4. Back to BGR — EasyOCR accepts both; BGR is safer for compatibility
-    """
     gray     = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
     clahe    = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     enhanced = clahe.apply(gray)
@@ -693,23 +864,32 @@ def preprocess_crop(crop: np.ndarray) -> np.ndarray:
 def ocr_worker():
     """
     Runs EasyOCR in its own thread so camera_worker() never blocks on readtext().
-    Receives (crop, (x1, y1)) tuples from crop_queue.
-    Applies preprocessing, runs OCR, then feeds results into the existing
-    duplicate-check → passive-alert → LLM pipeline unchanged.
+
+    [DIR-4] crop_queue items are now (crop, (x1,y1,x2,y2), annotated_frame).
+    [DIR-5] Direction is computed here from the box coords + frame width, then
+            passed through to both the passive alert and the LLM queue.
     """
     print("[OCR] Initializing EasyOCR...")
-    reader = easyocr.Reader(["en"], gpu=True)  # set gpu=False if no CUDA
+    reader = easyocr.Reader(["en"], gpu=True)
     print("[OCR] Ready.")
 
     while running:
         try:
-            crop, box_coords = crop_queue.get(timeout=0.5)
+            item = crop_queue.get(timeout=0.5)
         except queue.Empty:
             continue
 
         try:
-            # [OCR-4] removed — preprocessing hurt accuracy on clean signs.
-            # EasyOCR handles contrast internally; raw crop performs better.
+            # [DIR-4] Unpack the extended tuple
+            crop, box_coords, annotated_frame = item
+            x1, y1, x2, y2 = box_coords
+
+            # Infer frame width from the annotated frame shape
+            frame_h, frame_w = annotated_frame.shape[:2]
+
+            # [DIR-1] Compute direction before OCR so it's ready when we need it
+            direction = get_direction(x1, x2, frame_w)
+
             ocr_results = reader.readtext(crop, detail=0, paragraph=True)
 
             for text in ocr_results:
@@ -717,16 +897,27 @@ def ocr_worker():
                 if len(text) < 2:
                     continue
 
-                print(f"[OCR] '{text}'")
+                print(f"[OCR] '{text}'  →  {direction}")
 
                 if not is_duplicate(text):
                     # Passive AI path: immediate rule-based safety alert
-                    priority_key, passive_alert = build_passive_alert(text)
+                    # [DIR-5] Pass direction into build_passive_alert
+                    priority_key, passive_alert = build_passive_alert(text, direction)
+
                     if passive_alert and priority_key and should_speak_priority_alert(priority_key):
+                        # [DIR-3] Save snapshot before speaking so the file is on
+                        #         disk by the time the user hears the audio alert
+                        save_alert_snapshot(
+                            annotated_frame,
+                            (x1, y1, x2, y2),
+                            text,
+                            direction,
+                        )
                         speak(passive_alert)
+
                     elif len(text) > 3:
-                        # Non-priority text goes to LLM for contextual narration
-                        ocr_queue.put(text)
+                        # [DIR-6] Non-priority text → LLM, carry direction along
+                        ocr_queue.put((text, direction))
 
         except Exception as e:
             print(f"[OCR Error] {e}")
@@ -740,12 +931,12 @@ def ocr_worker():
 def camera_worker():
     """
     Camera thread: capture → YOLO → push crops to crop_queue.
-    EasyOCR no longer runs here — camera loop never blocks on OCR.
+
+    [DIR-4] crop_queue items now carry the full annotated frame so
+            ocr_worker can pass it to save_alert_snapshot().
     """
     print("[Camera] Loading YOLO model...")
     model = YOLO(MODEL_PATH)
-
-    # [OCR-1] EasyOCR init moved to ocr_worker() — removed from here
 
     cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
     if not cap.isOpened():
@@ -771,25 +962,24 @@ def camera_worker():
         for box in results[0].boxes:
             x1, y1, x2, y2 = map(int, box.xyxy[0])
 
-            # ── NOISE FILTER: skip small boxes ──
             box_area = (x2 - x1) * (y2 - y1)
             if box_area < MIN_BOX_AREA:
                 continue
 
-            # Padding
             pad = 6
-            x1 = max(0, x1 - pad)
-            y1 = max(0, y1 - pad)
-            x2 = min(frame.shape[1], x2 + pad)
-            y2 = min(frame.shape[0], y2 + pad)
+            x1p = max(0, x1 - pad)
+            y1p = max(0, y1 - pad)
+            x2p = min(frame.shape[1], x2 + pad)
+            y2p = min(frame.shape[0], y2 + pad)
 
-            crop = frame[y1:y2, x1:x2]
+            crop = frame[y1p:y2p, x1p:x2p]
             if crop.size == 0:
                 continue
 
-            # [OCR-1] Push crop to ocr_worker — camera never waits for readtext()
+            # [DIR-4] Push (crop, full_box, annotated_frame) instead of (crop, origin)
+            # We use the un-padded box coords for direction + snapshot highlighting
             try:
-                crop_queue.put_nowait((crop.copy(), (x1, y1)))
+                crop_queue.put_nowait((crop.copy(), (x1, y1, x2, y2), annotated.copy()))
             except queue.Full:
                 pass  # drop this crop; next frame will try again
 
@@ -801,6 +991,10 @@ def camera_worker():
                     (10, 56), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 255, 180), 1)
         cv2.putText(annotated, f"Custom priorities: {len(user_priority_list)}  |  conf>{CONFIDENCE_THRESHOLD}",
                     (10, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 220, 255), 1)
+        # [DIR-2] Show snapshot count on HUD
+        snap_count = len(os.listdir(ALERT_SNAPSHOT_DIR)) if os.path.isdir(ALERT_SNAPSHOT_DIR) else 0
+        cv2.putText(annotated, f"Snapshots saved: {snap_count}",
+                    (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 220, 120), 1)
 
         cv2.imshow("Vision Assistant", annotated)
 
@@ -824,6 +1018,10 @@ def main():
     # [OCR-3] Load saved priorities before any thread starts
     user_priority_list = load_priorities()
 
+    # [DIR-2] Ensure snapshot directory exists at startup
+    os.makedirs(ALERT_SNAPSHOT_DIR, exist_ok=True)
+    print(f"[Init] Alert snapshots will be saved to: {os.path.abspath(ALERT_SNAPSHOT_DIR)}/")
+
     # ── Ollama connectivity check ──
     print("[Check] Pinging Ollama...")
     try:
@@ -841,7 +1039,6 @@ def main():
             print("[ERROR] ELEVENLABS_API_KEY is not set in your .env file!")
             sys.exit(1)
         try:
-            # Test with a minimal TTS call — only needs speech synthesis permission
             test_resp = requests.post(
                 f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}",
                 headers={
@@ -886,7 +1083,7 @@ def main():
     t_voice.start()
     threads.append(t_voice)
 
-    # [OCR-1] Dedicated OCR thread — starts after LLM and voice
+    # [OCR-1] Dedicated OCR thread
     t_ocr = threading.Thread(target=ocr_worker, daemon=True, name="OCR")
     t_ocr.start()
     threads.append(t_ocr)

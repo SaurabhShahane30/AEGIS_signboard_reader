@@ -2,8 +2,8 @@
 llm.py — LLM brain: Ollama integration and command handling.
 
 Responsibilities:
-  - call_ollama()       : raw HTTP call to local Ollama instance
-  - llm_worker()        : daemon thread draining ocr_queue & speech_queue
+  - call_ollama()              : raw HTTP call to local Ollama instance
+  - llm_worker()               : daemon thread draining ocr_queue & speech_queue
   - _handle_command_response() : mutates user_priority_list based on LLM parse
 """
 
@@ -11,8 +11,8 @@ import time
 import requests
 
 from . import state
-from .config import OLLAMA_URL, OLLAMA_MODEL, LLM_RATE_LIMIT_SEC
-from .priority import priority_context
+from .config import OLLAMA_URL, OLLAMA_MODEL, LLM_RATE_LIMIT_SEC, LLM_ALERT_COOLDOWN_SEC
+from .priority import priority_context, clear_vote_buffer_for_item
 from .tts import speak
 from .session import log_event, format_context_for_prompt
 
@@ -42,10 +42,10 @@ as a priority item, treat it as a match and alert.
 
 SESSION CONTEXT AWARENESS:
 You will be given a log of recent events from this session.
-Use this to provide richer, more relevant alerts:
-  - If the same sign has been detected multiple times, mention it (e.g. "You've passed this sign before").
-  - If the user recently added a priority and you now see a match, make the alert feel connected.
-  - If you see a cluster of related detections, synthesise them into one meaningful alert.
+Use this only as background — do NOT alert based on past events alone.
+Only alert if the CURRENT OCR TEXT matches a priority item.
+You may enrich the alert message with context (e.g. "again" or "still ahead"),
+but only when the current text itself justifies an alert.
 
 Alert format:
   - Respond with: ALERT: <your message>
@@ -70,7 +70,7 @@ Valid outputs:
 
 Core behaviour:
   - Infer intent — do not rely on exact keywords.
-  - "notify me / alert me / let me know / watch for / keep an eye out for" → ADD
+  - "notify me / alert me / let me know / watch for / keep an eye out for / add ... to list" → ADD
   - "stop tracking / remove / don't alert for" → REMOVE
   - "what are my priorities / what am I tracking" → LIST
   - "reset / clear / delete all" → CLEAR
@@ -87,6 +87,18 @@ Examples:
 
   Input: keep an eye out for bus stops
   Output: ADD: bus stop
+
+  Input: keep an eye out for general stores
+  Output: ADD: general store
+
+  Input: add pharmacy to my list
+  Output: ADD: pharmacy
+
+  Input: add hospital to list
+  Output: ADD: hospital
+
+  Input: watch for pharmacy
+  Output: ADD: pharmacy
 
   Input: don't track pharmacy anymore
   Output: REMOVE: pharmacy
@@ -121,7 +133,7 @@ def call_ollama(prompt: str) -> str:
             "stream": False,
             "options": {
                 "temperature": 0.1,   # low = consistent structured responses
-                "num_predict": 80,    # slightly more room for semantic reasoning
+                "num_predict": 80,
             },
         }
         resp = requests.post(OLLAMA_URL, json=payload, timeout=15)
@@ -141,7 +153,9 @@ def call_ollama(prompt: str) -> str:
 def _handle_command_response(response: str):
     """
     Parse an LLM command response and mutate user_priority_list accordingly.
-    Also triggers a spoken confirmation.
+
+    After ADD or REMOVE, clears any stale vote-buffer entries so the camera
+    loop immediately starts fresh detection for the new priority item.
     """
     upper = response.upper()
 
@@ -150,12 +164,14 @@ def _handle_command_response(response: str):
         state.user_priority_list.add(item)
         speak(f"Added {item} to your priority list.")
         print(f"[Priority] User list: {state.user_priority_list}")
+        clear_vote_buffer_for_item(item)
 
     elif upper.startswith("REMOVE:"):
         item = response[7:].strip().lower()
         if item in state.user_priority_list:
             state.user_priority_list.discard(item)
             speak(f"Removed {item} from your priority list.")
+            clear_vote_buffer_for_item(item)
         else:
             speak(f"{item} was not in your list.")
 
@@ -185,6 +201,9 @@ def llm_worker():
     Flow:
       1. Drain speech_queue first (user voice commands are time-sensitive).
       2. Process one OCR item per LLM_RATE_LIMIT_SEC cycle.
+
+    Note: relevance filtering is done upstream in ocr_worker(), so every
+    item in ocr_queue has already passed the is_relevant_to_active_list() gate.
     """
     while state.running:
         # ── Voice commands (higher priority) ──────────────
@@ -214,7 +233,15 @@ def llm_worker():
             now = time.time()
 
             if (now - state.last_llm_call) < LLM_RATE_LIMIT_SEC:
+                # Rate limit active — drain the entire queue so stale crops
+                # don't pile up and fire as new alerts later.
                 state.ocr_queue.task_done()
+                while not state.ocr_queue.empty():
+                    try:
+                        state.ocr_queue.get_nowait()
+                        state.ocr_queue.task_done()
+                    except Exception:
+                        break
                 continue
 
             state.last_llm_call = now
@@ -232,8 +259,18 @@ def llm_worker():
 
             if response.upper().startswith("ALERT:"):
                 alert_text = response[6:].strip()
-                speak(alert_text)
-                log_event("alert", f"ocr='{ocr_text}' → alert='{alert_text}'")
+
+                # ── Alert-level dedup ─────────────────────────────
+                # Normalise: lowercase, strip punctuation for comparison
+                alert_key = "".join(c for c in alert_text.lower() if c.isalnum() or c == " ").strip()
+                now2 = time.time()
+                last_spoken = state.last_llm_alert_times.get(alert_key, 0)
+                if (now2 - last_spoken) < LLM_ALERT_COOLDOWN_SEC:
+                    print(f"[LLM] Alert suppressed (cooldown): '{alert_text}'")
+                else:
+                    state.last_llm_alert_times[alert_key] = now2
+                    speak(alert_text)
+                    log_event("alert", f"ocr='{ocr_text}' → alert='{alert_text}'")
 
             state.ocr_queue.task_done()
 

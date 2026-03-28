@@ -8,15 +8,20 @@ import threading
 from collections import deque
 
 # ── Inter-thread queues ────────────────────────────────────
-ocr_queue    = queue.Queue()     # camera  → llm_worker
-speech_queue = queue.Queue()     # voice   → llm_worker
-tts_queue    = queue.Queue()     # anyone  → tts_worker
+crop_queue   = queue.Queue(maxsize=4)  # camera  → ocr_worker  (bounded: drop if full)
+ocr_queue    = queue.Queue()           # ocr_worker → llm_worker
+speech_queue = queue.Queue()           # voice   → llm_worker
+tts_queue    = queue.Queue()           # anyone  → tts_worker
 
 # ── Deduplication buffer ───────────────────────────────────
 recent_texts: deque = deque(maxlen=30)   # (text, timestamp) pairs
 
-# ── LLM rate-limiting ──────────────────────────────────────
+# ── LLM rate-limiting ──────────────────────────────────
 last_llm_call: float = 0.0
+
+# ── LLM alert dedup — prevents same alert firing repeatedly ──
+# Maps normalised alert text -> timestamp last spoken
+last_llm_alert_times: dict = {}
 
 # ── Thread safety ──────────────────────────────────────────
 lock = threading.Lock()

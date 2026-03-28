@@ -1,21 +1,16 @@
 """
 main.py — Entry point for Vision Assistant.
 
-Startup sequence:
-  1. Verify Ollama is running.
-  2. Verify ElevenLabs API key (if USE_ELEVENLABS is True).
-  3. Launch daemon threads: TTS → LLM brain → Voice input.
-  4. Run camera loop on the main thread (required by OpenCV on Windows).
+Thread startup order:
+  1. TTS      — must be first so all other threads can call speak()
+  2. LLM      — processes voice commands and OCR alerts
+  3. Voice    — listens for wake word and commands
+  4. OCR      — runs EasyOCR on crops from camera (separate thread)
+  5. Camera   — YOLO inference + pushes crops (runs on main thread for OpenCV)
 
-Usage:
-    python main.py
-
-Prerequisites:
-    ollama serve          (in a separate terminal)
-    ollama pull llama3.1
-    pip install ultralytics easyocr opencv-python pyttsx3 \\
-                SpeechRecognition pyaudio numpy requests \\
-                sounddevice soundfile python-dotenv googletrans==4.0.0rc1
+Session lifecycle:
+  - start_session() called before threads start
+  - end_session() called on exit (user command or KeyboardInterrupt)
 """
 
 import sys
@@ -28,8 +23,9 @@ from utils.config import USE_ELEVENLABS, ELEVENLABS_API_KEY, ELEVENLABS_VOICE_ID
 from utils.tts import tts_worker, speak
 from utils.llm import llm_worker
 from utils.voice import voice_worker
-from utils.camera import camera_worker
+from utils.camera import camera_worker, ocr_worker
 from utils.session import start_session, end_session
+
 
 # ── Pre-flight checks ──────────────────────────────────────
 
@@ -91,36 +87,40 @@ def main():
 
     threads = []
 
-    # TTS thread — must start first so other threads can call speak()
+    # 1. TTS first — every other thread may call speak()
     t_tts = threading.Thread(target=tts_worker, daemon=True, name="TTS")
     t_tts.start()
     threads.append(t_tts)
-    time.sleep(0.4)   # give TTS engine time to initialise
+    time.sleep(0.4)   # give TTS engine a moment to initialise
 
     speak("Vision assistant starting up.")
 
-    # LLM brain thread
+    # 2. LLM brain
     t_llm = threading.Thread(target=llm_worker, daemon=True, name="LLM")
     t_llm.start()
     threads.append(t_llm)
 
-    # Voice input thread
+    # 3. Voice input
     t_voice = threading.Thread(target=voice_worker, daemon=True, name="Voice")
     t_voice.start()
     threads.append(t_voice)
 
-    # Camera loop — must run on the main thread (OpenCV / Windows requirement)
+    # 4. Dedicated OCR worker (receives crops from camera via state.crop_queue)
+    t_ocr = threading.Thread(target=ocr_worker, daemon=True, name="OCR")
+    t_ocr.start()
+    threads.append(t_ocr)
+
+    # 5. Camera on main thread (required by OpenCV on most platforms)
     try:
         camera_worker()
     except KeyboardInterrupt:
         print("\n[Main] Interrupted by user.")
     finally:
-        end_session(reason="process_exit")
         state.running = False
+        end_session(reason="process_exit")
         print("[Main] Shutting down threads...")
         time.sleep(1)
         print("[Main] Done.")
-
 
 if __name__ == "__main__":
     main()
