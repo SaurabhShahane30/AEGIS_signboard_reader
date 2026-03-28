@@ -1,0 +1,10 @@
+# Merged ICDAR 2015 + 2013 — YOLOv8s-OBB
+task: obb
+
+path: D:\signboard_model\signboard_project\dataset_obb
+train: images/train
+val:   images/val
+
+nc: 1
+names:
+  0: text

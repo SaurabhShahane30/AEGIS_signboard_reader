@@ -1,18 +1,7 @@
 """
-camera.py — Camera loop + dedicated OCR worker thread.
-
-Architecture:
-  camera_worker()  — YOLO inference → pushes crops into state.crop_queue.
-                     Never blocks on OCR; real-time camera loop.
-  ocr_worker()     — pops crops → EasyOCR (paragraph mode)
-                     → relevance gate → dedup → passive alert or LLM queue.
-
-Priority gate:
-  CRITICAL-ONLY mode  (user_priority_list is empty)
-      Only text fuzzy-matching CRITICAL_LIST is forwarded.
-  PRIORITY+CRITICAL mode  (user_priority_list has >= 1 item)
-      Text matching CRITICAL_LIST OR user_priority_list is forwarded.
-  Mode switches automatically on ADD / CLEAR voice commands.
+camera.py — Camera loop: YOLO detection → EasyOCR → priority routing.
+KEY FIX: All crops batched together, combined into one string before
+priority check — so "MOBILE PHONE" gets detected instead of just "MOBILE".
 """
 
 import cv2
@@ -33,6 +22,7 @@ import torch
 from ultralytics.nn import tasks as _ul_tasks
 
 from . import state
+print(state.__file__)
 from .config import (
     MODEL_PATH, CAMERA_INDEX,
     CONFIDENCE_THRESHOLD, MIN_BOX_AREA,
@@ -57,73 +47,27 @@ _ul_tasks.torch_safe_load = _patched_torch_safe_load
 
 
 # ── Constants ────────────────────────────────────────────────────────
-PAD          = 6    # pixels of padding around each YOLO box
-MIN_TEXT_LEN = 2    # minimum OCR text length to consider
+OCR_EVERY_N_FRAMES = 4
+MIN_CONFIDENCE     = 0.35
+MIN_TEXT_LEN       = 2
+PAD                = 12
 
-# Vote buffer: used by clear_vote_buffer_for_item() in priority.py
-# to flush stale entries when the priority list changes.
-_vote_buffer: dict = {}   # text_lower -> hit_count
-
-
-# ── OCR worker ───────────────────────────────────────────────────────
-
-def ocr_worker():
-    """
-    Dedicated OCR thread — receives (crop, (x1,y1)) from state.crop_queue.
-
-    Pipeline per crop:
-      1. EasyOCR readtext  (paragraph=True, detail=0)
-      2. Relevance gate    — drop text not matching active list (fuzzy)
-      3. Dedup check       — drop text seen within cooldown window
-      4. Passive alert     — immediate speak for critical/priority exact matches
-      5. LLM queue         — relevant non-critical text forwarded to llm_worker
-      6. log_event         — every forwarded text logged to session JSON
-    """
-    print("[OCR] Initialising EasyOCR...")
-    reader = easyocr.Reader(["en"], gpu=True)
-    print("[OCR] Ready.")
-
-    while state.running:
-        try:
-            crop, box_coords, ts = state.crop_queue.get(timeout=0.5)
-            if time.time() - ts > 2:
-                continue  # Skip old crops to reduce latency
-        except queue.Empty:
-            continue
-
-        try:
-            ocr_results = reader.readtext(crop, detail=0, paragraph=True)
-
-            for text in ocr_results:
-                text = text.strip()
-                if len(text) < MIN_TEXT_LEN:
-                    continue
-
-                print(f"[OCR] '{text}'")
-
-                # ── Relevance gate ────────────────────────────────────
-                if not is_relevant_to_active_list(text):
-                    continue
-
-                # ── Dedup + routing ───────────────────────────────────
-                if not is_duplicate(text):
-                    priority_key, passive_alert = build_passive_alert(text)
-                    if passive_alert and priority_key \
-                            and should_speak_priority_alert(priority_key):
-                        speak(passive_alert)
-                        log_event("alert",
-                                  f"passive alert='{passive_alert}'  ocr='{text}'")
-                    elif len(text) > 3:
-                        state.ocr_queue.put(text)
-                        log_event("detection", f"ocr='{text}'")
-
-        except Exception as e:
-            print(f"[OCR Error] {e}")
-        finally:
-            state.crop_queue.task_done()
+# CLAHE created once at startup
+_CLAHE = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
 
-# ── Camera worker ─────────────────────────────────────────────────────
+def preprocess_crop_for_ocr(crop: np.ndarray) -> np.ndarray:
+    h, w = crop.shape[:2]
+    if h < 120:
+        scale = 120 / h
+        crop = cv2.resize(crop, (max(int(w * scale), 1), 120),
+                          interpolation=cv2.INTER_CUBIC)
+    gray  = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    gray  = _CLAHE.apply(gray)
+    gray  = cv2.GaussianBlur(gray, (3, 3), 0)
+    _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return cv2.cvtColor(bw, cv2.COLOR_GRAY2BGR)
+
 
 def camera_worker():
     """
@@ -151,31 +95,73 @@ def camera_worker():
             time.sleep(0.05)
             continue
 
-        # ── YOLO inference ──────────────────────────────────────────
+        frame_count += 1
+        run_ocr_this_frame = (frame_count % OCR_EVERY_N_FRAMES == 0)
+
+        # ── YOLO inference ──────────────────────────────────
         results   = model(frame, conf=CONFIDENCE_THRESHOLD, verbose=False)
         annotated = results[0].plot()
+
+        # Collect all crops this frame
+        crops_this_frame = []
 
         for box in results[0].boxes:
             x1, y1, x2, y2 = map(int, box.xyxy[0])
 
-            if (x2 - x1) * (y2 - y1) < MIN_BOX_AREA:
+            box_area = (x2 - x1) * (y2 - y1)
+            if box_area < MIN_BOX_AREA:
                 continue
 
-            x1p = max(0, x1 - PAD)
-            y1p = max(0, y1 - PAD)
-            x2p = min(frame.shape[1], x2 + PAD)
-            y2p = min(frame.shape[0], y2 + PAD)
+            px1 = max(0, x1 - PAD)
+            py1 = max(0, y1 - PAD)
+            px2 = min(frame.shape[1], x2 + PAD)
+            py2 = min(frame.shape[0], y2 + PAD)
 
-            crop = frame[y1p:y2p, x1p:x2p]
+            crop = frame[py1:py2, px1:px2]
             if crop.size == 0:
                 continue
 
-            try:
-                state.crop_queue.put_nowait((crop.copy(), (x1p, y1p), time.time()))
-            except queue.Full:
-                pass   # ocr_worker is behind — drop, next frame retries
+            crops_this_frame.append((crop, px1, py1, box_area))
 
-        # ── HUD ──────────────────────────────────────────────────────
+        # ── OCR every N frames only ─────────────────────────
+        all_words = []
+
+        if run_ocr_this_frame and crops_this_frame:
+            for (crop, px1, py1, box_area) in crops_this_frame:
+                try:
+                    processed = preprocess_crop_for_ocr(crop)
+                    results_ocr = reader.readtext(processed, detail=1)
+
+                    for (_, text, conf) in results_ocr:
+                        text = text.strip()
+                        if conf >= MIN_CONFIDENCE and len(text) >= MIN_TEXT_LEN:
+                            all_words.append(text)
+                            print(f"[OCR] '{text}'  (box: {box_area}px²)")
+
+                            cv2.putText(
+                                annotated, text,
+                                (px1, max(py1 - 8, 12)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.65,
+                                (0, 255, 255), 2,
+                            )
+                except Exception as e:
+                    print(f"[OCR Error] {e}")
+
+        # ── KEY FIX: combine ALL words into ONE string ──────
+        # "MOBILE" + "PHONE" + "NOT" + "USE" → "MOBILE PHONE NOT USE"
+        # Priority check now sees the full sentence, not individual words
+        if all_words:
+            combined = " ".join(all_words)
+            print(f"[OCR Combined] '{combined}'")
+
+            if not is_duplicate(combined):
+                priority_key, passive_alert = build_passive_alert(combined)
+                if passive_alert and priority_key and should_speak_priority_alert(priority_key):
+                    speak(passive_alert)
+                elif len(combined) > 3:
+                    state.ocr_queue.put(combined)
+
+        # ── HUD overlay ─────────────────────────────────────────
         ts = datetime.now().strftime("%H:%M:%S")
         cv2.putText(annotated, f"Vision Assistant  {ts}",
                     (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
