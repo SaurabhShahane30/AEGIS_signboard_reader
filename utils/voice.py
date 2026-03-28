@@ -18,7 +18,9 @@ import speech_recognition as sr
 from . import state
 from .config import WAKE_WORD
 from .tts import speak
+from .session import end_session, log_event
 
+END_SESSION_PHRASES = {"end session", "end the session", "stop session", "finish session"}
 
 def voice_worker():
     """
@@ -59,6 +61,15 @@ def voice_worker():
 
             command = recognizer.recognize_google(cmd_audio).lower()
             print(f"[Voice] Command: '{command}'")
+            
+            # ── Intercept "end session" — never send to LLM ──
+            if any(phrase in command for phrase in END_SESSION_PHRASES):
+                speak("Session ended. Goodbye.")
+                log_event("command", "end session")
+                end_session(reason="user_command")
+                state.running = False
+                return
+ 
             state.speech_queue.put(command)
 
         except sr.WaitTimeoutError:

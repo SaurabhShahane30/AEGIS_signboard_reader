@@ -33,3 +33,8 @@ last_priority_alert_times: dict = {}
 
 # ── User priority list (mutable at runtime via voice) ──────
 user_priority_list: set = set()
+
+# ── Session management ─────────────────────────────────────
+session_active: bool       = False
+current_session_id: str    = ""
+_session_data: dict        = {}    # internal: owned by session.py

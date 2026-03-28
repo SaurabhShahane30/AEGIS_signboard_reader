@@ -29,6 +29,7 @@ from utils.tts import tts_worker, speak
 from utils.llm import llm_worker
 from utils.voice import voice_worker
 from utils.camera import camera_worker
+from utils.session import start_session, end_session
 
 # ── Pre-flight checks ──────────────────────────────────────
 
@@ -86,6 +87,8 @@ def main():
     if USE_ELEVENLABS:
         check_elevenlabs()
 
+    start_session()
+
     threads = []
 
     # TTS thread — must start first so other threads can call speak()
@@ -112,6 +115,7 @@ def main():
     except KeyboardInterrupt:
         print("\n[Main] Interrupted by user.")
     finally:
+        end_session(reason="process_exit")
         state.running = False
         print("[Main] Shutting down threads...")
         time.sleep(1)
