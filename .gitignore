@@ -11,3 +11,6 @@ raw_data/
 raw_data_2013/
 signboard_project/dataset_merged/images/
 signboard_project/dataset_merged/labels/
+signboard_project/dataset_obb/images/
+signboard_project/dataset_obb/labels/
+sessions/

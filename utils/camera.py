@@ -1,7 +1,8 @@
 """
 camera.py — Camera loop: YOLO detection → EasyOCR → priority routing.
-KEY FIX: All crops batched together, combined into one string before
-priority check — so "MOBILE PHONE" gets detected instead of just "MOBILE".
+KEY FIX: Nearby boxes are merged into one big region before OCR.
+So instead of reading 'MOBILE', 'PHONE' separately,
+it reads the whole signboard as 'DO NOT USE MOBILE PHONE'.
 """
 
 import cv2
@@ -11,6 +12,7 @@ from datetime import datetime
 from ultralytics import YOLO
 
 from . import state
+print(state.__file__)
 from .config import (
     MODEL_PATH, CAMERA_INDEX,
     CONFIDENCE_THRESHOLD, MIN_BOX_AREA,
@@ -34,7 +36,11 @@ MIN_CONFIDENCE     = 0.35
 MIN_TEXT_LEN       = 2
 PAD                = 12
 
-# CLAHE created once at startup
+# How close two boxes must be (in pixels) to be grouped as one signboard.
+# Increase this if boxes on the same sign are still being treated separately.
+# Decrease if boxes from different signs are being wrongly merged.
+MERGE_DISTANCE     = 80
+
 _CLAHE = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
 
@@ -49,6 +55,81 @@ def preprocess_crop_for_ocr(crop: np.ndarray) -> np.ndarray:
     gray  = cv2.GaussianBlur(gray, (3, 3), 0)
     _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     return cv2.cvtColor(bw, cv2.COLOR_GRAY2BGR)
+
+
+def boxes_are_close(b1, b2, max_dist: int) -> bool:
+    """
+    Check if two boxes are close enough to belong to the same signboard.
+
+    b1 and b2 are (x1, y1, x2, y2) tuples.
+
+    Logic: find the gap between the two boxes in both X and Y directions.
+    If both gaps are within max_dist, they are neighbours on the same sign.
+
+    Gap calculation:
+      - If boxes overlap in an axis, gap = 0 (they're already touching)
+      - If boxes don't overlap, gap = distance between their nearest edges
+    """
+    x_gap = max(0, max(b1[0], b2[0]) - min(b1[2], b2[2]))
+    y_gap = max(0, max(b1[1], b2[1]) - min(b1[3], b2[3]))
+    return x_gap <= max_dist and y_gap <= max_dist
+
+
+def merge_boxes(boxes: list[tuple]) -> list[tuple]:
+    """
+    Group nearby boxes and merge each group into one big bounding box.
+
+    Returns a list of merged (x1, y1, x2, y2) boxes — one per signboard.
+
+    Algorithm (Union-Find style grouping):
+      1. Start — every box is its own group.
+      2. For every pair of boxes, if they are close → merge their groups.
+      3. Repeat until no more merges happen.
+      4. For each group, compute the bounding box that covers all boxes in it.
+
+    Why not just one pass?
+      A chain like [box1 near box2, box2 near box3] needs multiple passes
+      so box1 and box3 end up in the same group even if they aren't directly close.
+    """
+    if not boxes:
+        return []
+
+    # Each box starts in its own group (group id = index)
+    groups = list(range(len(boxes)))
+
+    def find(i):
+        while groups[i] != i:
+            groups[i] = groups[groups[i]]
+            i = groups[i]
+        return i
+
+    def union(i, j):
+        groups[find(i)] = find(j)
+
+    # Merge groups for all close pairs
+    for i in range(len(boxes)):
+        for j in range(i + 1, len(boxes)):
+            if boxes_are_close(boxes[i], boxes[j], MERGE_DISTANCE):
+                union(i, j)
+
+    # Collect all boxes that share the same root into groups
+    group_map = {}
+    for i, box in enumerate(boxes):
+        root = find(i)
+        if root not in group_map:
+            group_map[root] = []
+        group_map[root].append(box)
+
+    # For each group, compute one big bounding box covering all boxes in it
+    merged = []
+    for group_boxes in group_map.values():
+        x1 = min(b[0] for b in group_boxes)
+        y1 = min(b[1] for b in group_boxes)
+        x2 = max(b[2] for b in group_boxes)
+        y2 = max(b[3] for b in group_boxes)
+        merged.append((x1, y1, x2, y2))
+
+    return merged
 
 
 def camera_worker():
@@ -82,60 +163,68 @@ def camera_worker():
         frame_count += 1
         run_ocr_this_frame = (frame_count % OCR_EVERY_N_FRAMES == 0)
 
-        # ── YOLO inference ──────────────────────────────────
+        # ── YOLO inference ──────────────────────────────────────
         results   = model(frame, conf=CONFIDENCE_THRESHOLD, verbose=False)
         annotated = results[0].plot()
 
-        # Collect all crops this frame
-        crops_this_frame = []
-
+        # ── Step 1: Collect all valid boxes from YOLO ───────────
+        raw_boxes = []
         for box in results[0].boxes:
             x1, y1, x2, y2 = map(int, box.xyxy[0])
-
             box_area = (x2 - x1) * (y2 - y1)
             if box_area < MIN_BOX_AREA:
                 continue
+            # Apply padding to each individual box before merging
+            x1 = max(0, x1 - PAD)
+            y1 = max(0, y1 - PAD)
+            x2 = min(frame.shape[1], x2 + PAD)
+            y2 = min(frame.shape[0], y2 + PAD)
+            raw_boxes.append((x1, y1, x2, y2))
 
-            px1 = max(0, x1 - PAD)
-            py1 = max(0, y1 - PAD)
-            px2 = min(frame.shape[1], x2 + PAD)
-            py2 = min(frame.shape[0], y2 + PAD)
+        # ── Step 2: Merge nearby boxes into one region per sign ─
+        merged_boxes = merge_boxes(raw_boxes)
 
-            crop = frame[py1:py2, px1:px2]
-            if crop.size == 0:
-                continue
-
-            crops_this_frame.append((crop, px1, py1, box_area))
-
-        # ── OCR every N frames only ─────────────────────────
+        # ── Step 3: OCR each merged region as one signboard ─────
         all_words = []
 
-        if run_ocr_this_frame and crops_this_frame:
-            for (crop, px1, py1, box_area) in crops_this_frame:
+        if run_ocr_this_frame and merged_boxes:
+            for (mx1, my1, mx2, my2) in merged_boxes:
+                crop = frame[my1:my2, mx1:mx2]
+                if crop.size == 0:
+                    continue
+
                 try:
-                    processed = preprocess_crop_for_ocr(crop)
+                    processed   = preprocess_crop_for_ocr(crop)
                     results_ocr = reader.readtext(processed, detail=1)
 
+                    box_words = []
                     for (_, text, conf) in results_ocr:
                         text = text.strip()
                         if conf >= MIN_CONFIDENCE and len(text) >= MIN_TEXT_LEN:
-                            all_words.append(text)
-                            print(f"[OCR] '{text}'  (box: {box_area}px²)")
+                            box_words.append(text)
 
-                            cv2.putText(
-                                annotated, text,
-                                (px1, max(py1 - 8, 12)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.65,
-                                (0, 255, 255), 2,
-                            )
+                    if box_words:
+                        # Join words from this merged region in reading order
+                        sign_text = " ".join(box_words)
+                        print(f"[OCR Sign] '{sign_text}'")
+                        all_words.append(sign_text)
+
+                        # Draw merged box on screen in green
+                        cv2.rectangle(annotated, (mx1, my1), (mx2, my2),
+                                      (0, 255, 0), 2)
+                        cv2.putText(
+                            annotated, sign_text[:40],  # cap display length
+                            (mx1, max(my1 - 8, 12)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.65,
+                            (0, 255, 255), 2,
+                        )
+
                 except Exception as e:
                     print(f"[OCR Error] {e}")
 
-        # ── KEY FIX: combine ALL words into ONE string ──────
-        # "MOBILE" + "PHONE" + "NOT" + "USE" → "MOBILE PHONE NOT USE"
-        # Priority check now sees the full sentence, not individual words
+        # ── Step 4: Combine all signs and route to priority/LLM ─
         if all_words:
-            combined = " ".join(all_words)
+            combined = " | ".join(all_words)
             print(f"[OCR Combined] '{combined}'")
 
             if not is_duplicate(combined):
@@ -145,7 +234,7 @@ def camera_worker():
                 elif len(combined) > 3:
                     state.ocr_queue.put(combined)
 
-        # ── HUD overlay ─────────────────────────────────────────
+        # ── HUD overlay ──────────────────────────────────────────
         ts = datetime.now().strftime("%H:%M:%S")
         cv2.putText(annotated, f"Vision Assistant  {ts}",
                     (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)

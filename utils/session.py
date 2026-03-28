@@ -30,7 +30,7 @@ import json
 import os
 from datetime import datetime
 
-import state
+from . import state
 
 SESSIONS_DIR = "sessions"
 

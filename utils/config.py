@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── Model & Camera ─────────────────────────────────────────
-MODEL_PATH           = "../signboard_project/best_yolov8s.pt"
+MODEL_PATH           = "./signboard_project/best_yolov8s.pt"
 CAMERA_INDEX         = 0
 CONFIDENCE_THRESHOLD = 0.5
 MIN_BOX_AREA         = 3000          # px² — ignore tiny/noisy detections
