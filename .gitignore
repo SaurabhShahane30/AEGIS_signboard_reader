@@ -8,3 +8,6 @@ __pycache__/
 *.pyc
 raw_data/
 .venv/
+raw_data_2013/
+signboard_project/dataset_merged/images/
+signboard_project/dataset_merged/labels/

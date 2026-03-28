@@ -1,0 +1,8 @@
+# Merged ICDAR 2015 + ICDAR 2013 — YOLOv8 Single class: "text"
+path: D:\signboard_model\signboard_project\dataset_merged
+train: images/train
+val:   images/val
+
+nc: 1
+names:
+  0: text
