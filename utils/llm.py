@@ -9,74 +9,102 @@ Responsibilities:
 
 import time
 import requests
+
 from . import state
 from .config import OLLAMA_URL, OLLAMA_MODEL, LLM_RATE_LIMIT_SEC
 from .priority import priority_context
 from .tts import speak
+from .session import log_event, format_context_for_prompt
 
 # ── System Prompt ──────────────────────────────────────────
 SYSTEM_PROMPT = """You are a vision assistant operating within a real-time camera system.
 
-ROLE 1 — ACTIVE WATCHER:
-Given OCR text from a camera frame, decide whether it requires an alert.
+════════════════════════════════════════
+ROLE 1 — ACTIVE WATCHER (OCR alerts)
+════════════════════════════════════════
+You receive OCR text detected from a camera frame, the user's priority list,
+a hardcoded critical safety list, and recent session context.
 
-If it matches or closely resembles a critical item or user priority → respond with a short, natural alert message.
-Otherwise → respond: IGNORE
+Your job: decide if the OCR text warrants alerting the user.
 
-Alert style:
-Use calm, friendly, human-like phrasing
-Avoid rigid or robotic wording
-Do not use prefixes like "ALERT:"
-Keep under 15 words
+SEMANTIC MATCHING — this is critical:
+Do NOT require exact word matches. Use your language understanding to judge meaning.
+Examples of what this means in practice:
+  - User priority "pharmacy" → also alert for: chemist, medical store, drugstore,
+    medicine shop, Apollo, MedPlus, Wellness Forever, or any store clearly selling medicines.
+  - User priority "hospital" → also alert for: clinic, nursing home, emergency, casualty,
+    health centre, or any medical facility sign.
+  - User priority "restaurant" → also alert for: café, dhaba, eatery, food court, bistro,
+    or any establishment clearly serving food.
+  - Critical item "wet floor" → also alert for: slippery surface, caution floor, mopped area.
+The rule: if a reasonable person would consider the detected text to be the same category
+as a priority item, treat it as a match and alert.
 
-ROLE 2 — INTENT PARSER FOR PRIORITY MEMORY:
+SESSION CONTEXT AWARENESS:
+You will be given a log of recent events from this session.
+Use this to provide richer, more relevant alerts:
+  - If the same sign has been detected multiple times, mention it (e.g. "You've passed this sign before").
+  - If the user recently added a priority and you now see a match, make the alert feel connected.
+  - If you see a cluster of related detections, synthesise them into one meaningful alert.
 
-You receive one user voice command at a time.
-Map the natural language input to exactly one structured action.
+Alert format:
+  - Respond with: ALERT: <your message>
+  - Keep under 15 words
+  - Calm, friendly, human-like tone
+  - No robotic phrasing
+  - If no match: respond exactly with: IGNORE
 
-Valid outputs only:
-ADD: <item>
-REMOVE: <item>
-LIST:
-CLEAR:
-UNKNOWN: <short helpful reply>
+════════════════════════════════════════
+ROLE 2 — INTENT PARSER (voice commands)
+════════════════════════════════════════
+You receive one user voice command and recent command history from this session.
 
-Core behavior:
-Infer intent, do not rely on exact keywords.
-If user expresses "notify me / alert me / let me know / watch for / remember / keep an eye out for" an object or place, treat it as ADD.
-If user says stop tracking / remove / don't alert for something, treat it as REMOVE.
-If user asks what is being tracked, treat as LIST.
-If user asks to reset/delete all custom tracked items, treat as CLEAR.
-Normalize item: lowercase, singular when appropriate, remove filler words and articles, keep a concise noun phrase.
+Map the input to exactly one structured action.
 
-High-priority examples:
-Input: let me know when we find a pharmacy
-Output: ADD: pharmacy
+Valid outputs:
+  ADD: <item>
+  REMOVE: <item>
+  LIST:
+  CLEAR:
+  UNKNOWN: <short helpful reply>
 
-Input: alert me if you see a hospital sign
-Output: ADD: hospital
+Core behaviour:
+  - Infer intent — do not rely on exact keywords.
+  - "notify me / alert me / let me know / watch for / keep an eye out for" → ADD
+  - "stop tracking / remove / don't alert for" → REMOVE
+  - "what are my priorities / what am I tracking" → LIST
+  - "reset / clear / delete all" → CLEAR
+  - Normalise item: lowercase, singular, remove filler words, concise noun phrase.
+  - Use session command history to resolve pronouns:
+      "remove that" / "forget the last one" → infer from the most recent ADD in history.
 
-Input: keep an eye out for bus stops
-Output: ADD: bus stop
+Examples:
+  Input: let me know when we find a pharmacy
+  Output: ADD: pharmacy
 
-Input: don't track pharmacy anymore
-Output: REMOVE: pharmacy
+  Input: alert me if you see a hospital sign
+  Output: ADD: hospital
 
-Input: what are my priorities
-Output: LIST:
+  Input: keep an eye out for bus stops
+  Output: ADD: bus stop
 
-Input: clear my list
-Output: CLEAR:
+  Input: don't track pharmacy anymore
+  Output: REMOVE: pharmacy
 
-Input: hello how are you
-Output: UNKNOWN: I can add, remove, list, or clear priority items.
+  Input: remove that     (last command was ADD: pharmacy)
+  Output: REMOVE: pharmacy
+
+  Input: what are my priorities
+  Output: LIST:
+
+  Input: clear my list
+  Output: CLEAR:
+
+  Input: hello how are you
+  Output: UNKNOWN: I can add, remove, list, or clear priority items.
 
 Output constraints:
-Exactly one line
-No markdown
-No explanations
-No extra text beyond the required format
-Plain text only. Single-line response."""
+  Exactly one line. No markdown. No explanations. Plain text only."""
 
 
 # ── Ollama caller ──────────────────────────────────────────
@@ -93,7 +121,7 @@ def call_ollama(prompt: str) -> str:
             "stream": False,
             "options": {
                 "temperature": 0.1,   # low = consistent structured responses
-                "num_predict": 60,    # short outputs only
+                "num_predict": 80,    # slightly more room for semantic reasoning
             },
         }
         resp = requests.post(OLLAMA_URL, json=payload, timeout=15)
@@ -163,14 +191,18 @@ def llm_worker():
         try:
             command = state.speech_queue.get_nowait()
             print(f"\n🎤 Command: '{command}'")
+            session_ctx = format_context_for_prompt(n=8)
             prompt = (
+                f"TASK: ROLE 2 — intent parsing for priority memory management.\n\n"
+                f"{session_ctx}\n\n"
+                f"{priority_context()}\n\n"
                 f'USER_UTTERANCE: "{command}"\n'
-                "TASK: infer intent for priority memory management using ROLE 2 rules.\n"
-                f"{priority_context()}"
+                f"Map this to exactly one structured action."
             )
             response = call_ollama(prompt)
             print(f"[LLM → Command] {response}")
             _handle_command_response(response)
+            log_event("command", f"input='{command}' → response='{response}'")
             state.speech_queue.task_done()
             continue
         except Exception:
@@ -186,16 +218,22 @@ def llm_worker():
                 continue
 
             state.last_llm_call = now
+            session_ctx = format_context_for_prompt(n=10)
             prompt = (
-                f'OCR TEXT from camera: "{ocr_text}"\n'
-                f"{priority_context()}\n"
-                "Should I alert the user?"
+                f"TASK: ROLE 1 — decide if this OCR text warrants an alert.\n\n"
+                f"{session_ctx}\n\n"
+                f"{priority_context()}\n\n"
+                f'OCR TEXT from camera: "{ocr_text}"\n\n'
+                f"Use semantic matching and session context. "
+                f"Respond with ALERT: <message> or IGNORE."
             )
             response = call_ollama(prompt)
             print(f"[LLM → OCR] {response}")
 
             if response.upper().startswith("ALERT:"):
-                speak(response[6:].strip())
+                alert_text = response[6:].strip()
+                speak(alert_text)
+                log_event("alert", f"ocr='{ocr_text}' → alert='{alert_text}'")
 
             state.ocr_queue.task_done()
 
