@@ -111,12 +111,12 @@ OLLAMA_MODEL         = "llama3.1:8b"
 # Speech output options
 TARGET_LANGUAGE      = "en"           # e.g. "en", "hi", "es"
 SOURCE_LANGUAGE      = "auto"
-USE_ELEVENLABS       = True
+USE_ELEVENLABS       = False
 ELEVENLABS_API_KEY   = os.getenv("ELEVENLABS_API_KEY", "")
 ELEVENLABS_VOICE_ID  = os.getenv("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")
 ELEVENLABS_MODEL_ID  = "eleven_multilingual_v2"
 TTS_HTTP_TIMEOUT_SEC = 12
-PRIORITY_REPEAT_COOLDOWN_SEC = 12  # suppress repeating same priority alert too often
+PRIORITY_REPEAT_COOLDOWN_SEC = 4    # suppress repeating same priority alert too often
 
 # [DIR-2] Snapshot output directory
 ALERT_SNAPSHOT_DIR   = "alert_snapshots"
@@ -327,61 +327,44 @@ def save_alert_snapshot(
 # ─────────────────────────────────────────────
 #  OLLAMA CALLER
 # ─────────────────────────────────────────────
-SYSTEM_PROMPT = """You are a vision assistant operating within a real-time camera system.
+SYSTEM_PROMPT_WATCHER = """You are a vision assistant for a real-time camera system.
 
-ROLE 1 — ACTIVE WATCHER:
 Given OCR text from a camera frame, decide whether it requires an alert.
 
 If it matches or closely resembles a critical item or user priority → respond with a short, natural alert message.
 Otherwise → respond: IGNORE
 
-Alert style:
+Rules:
+- Calm, friendly, human-like phrasing
+- No prefixes like "ALERT:" or "---" or role labels
+- Under 15 words
+- Include direction naturally if provided (e.g. "Pharmacy detected to your left.")
+- Output ONLY the single alert sentence or the word IGNORE. Nothing else."""
 
-Use calm, friendly, human-like phrasing
-Avoid rigid or robotic wording
-Do not use prefixes like "ALERT:"
-Keep under 20 words
-If a direction is provided, naturally include it (e.g. "Pharmacy detected to your left.")
-- Output ONLY the final alert sentence.
-- Example:
-  Input: pharmacy
-  Output: Pharmacy detected to your right.
+SYSTEM_PROMPT_INTENT = """You are an intent parser for a priority memory system.
 
-ROLE 2 — INTENT PARSER FOR PRIORITY MEMORY:
+Map the user's voice command to exactly one structured action.
 
-You receive one user voice command at a time.
-Map the natural language input to exactly one structured action.
-Map the natural language input to exactly one structured action.
-
-Valid outputs only:
+Valid outputs:
 ADD: <item>
 REMOVE: <item>
 LIST:
 CLEAR:
 UNKNOWN: <short helpful reply>
 
-Core behavior:
+Rules:
+- Infer intent, don't require exact keywords
+- "notify/alert/watch for/remember" → ADD
+- "stop tracking/remove/don't alert" → REMOVE
+- Normalize item: lowercase, singular, no filler words
+- Output EXACTLY one line, no markdown, no explanation
 
-Infer intent, do not rely on exact keywords.
-If user expresses "notify me / alert me / let me know / watch for / remember / keep an eye out for" an object or place, treat it as ADD.
-If user says stop tracking / remove / don't alert for something, treat it as REMOVE.
-If user asks what is being tracked, treat as LIST.
-If user asks to reset/delete all custom tracked items, treat as CLEAR.
-Normalize item:
-lowercase
-singular when appropriate
-remove filler words and articles
-keep a concise noun phrase
-
-High-priority examples:
+Examples:
 Input: let me know when we find a pharmacy
 Output: ADD: pharmacy
 
-Input: alert me if you see a hospital sign
+Input: alert me if you see a hospital
 Output: ADD: hospital
-
-Input: keep an eye out for bus stops
-Output: ADD: bus stop
 
 Input: don't track pharmacy anymore
 Output: REMOVE: pharmacy
@@ -394,7 +377,6 @@ Output: CLEAR:
 
 Input: hello how are you
 Output: UNKNOWN: I can add, remove, list, or clear priority items.
-
 Output constraints:
 
 Exactly one line
@@ -404,16 +386,15 @@ No extra text beyond the required format
 Plain text only. Single-line response."""
 
 
-def call_ollama(prompt: str) -> str:
-    """Call local Ollama and return response text."""
+def call_ollama(prompt: str, system_prompt: str = SYSTEM_PROMPT_WATCHER) -> str:
     try:
         payload = {
             "model": OLLAMA_MODEL,
-            "prompt": f"{SYSTEM_PROMPT}\n\n{prompt}",
+            "prompt": f"{system_prompt}\n\n{prompt}",
             "stream": False,
             "options": {
-                "temperature": 0.1,   # low temp = consistent structured responses
-                "num_predict": 60     # short responses only
+                "temperature": 0.1,
+                "num_predict": 40
             }
         }
         resp = requests.post(OLLAMA_URL, json=payload, timeout=15)
@@ -425,8 +406,6 @@ def call_ollama(prompt: str) -> str:
     except Exception as e:
         print(f"[Ollama Error] {e}")
         return "IGNORE"
-
-
 # ─────────────────────────────────────────────
 #  TTS THREAD
 # ─────────────────────────────────────────────
@@ -671,7 +650,6 @@ def build_passive_alert(text: str, direction: str = "straight ahead"):
 
     return None, None
 
-
 def should_speak_priority_alert(priority_key: str) -> bool:
     """Rate-limit repeated passive alerts for the same priority item."""
     now = time.time()
@@ -681,7 +659,6 @@ def should_speak_priority_alert(priority_key: str) -> bool:
             return False
         last_priority_alert_times[priority_key] = now
     return True
-
 
 def priority_context() -> str:
     return (
@@ -708,16 +685,15 @@ def llm_worker():
     global last_llm_call, user_priority_list
 
     while running:
-        # Voice commands = higher priority
+        # ── Voice commands (highest priority, checked first) ──────────────
         try:
             command = speech_queue.get_nowait()
             print(f"\n🎤 Command: '{command}'")
             prompt = (
                 f'USER_UTTERANCE: "{command}"\n'
-                "TASK: infer intent for priority memory management using ROLE 2 rules.\n"
                 f"{priority_context()}"
             )
-            response = call_ollama(prompt)
+            response = call_ollama(prompt, system_prompt=SYSTEM_PROMPT_INTENT)
             print(f"[LLM -> Command] {response}")
             _handle_command_response(response)
             speech_queue.task_done()
@@ -725,43 +701,38 @@ def llm_worker():
         except queue.Empty:
             pass
 
-        # OCR alerts
-        # [DIR-6] ocr_queue items now carry (text, direction) tuples
+        # ── OCR alerts ────────────────────────────────────────────────────
         try:
             item = ocr_queue.get(timeout=0.3)
 
-            # Backwards compat: plain string or (text, direction) tuple
             if isinstance(item, tuple):
                 ocr_text, direction = item
             else:
-                ocr_text, direction = item, "straight ahead"
+                ocr_text, direction = str(item), "straight ahead"
 
             now = time.time()
-
             if (now - last_llm_call) < LLM_RATE_LIMIT_SEC:
                 ocr_queue.task_done()
                 continue
 
             last_llm_call = now
 
-            # [DIR-6] Include direction in the prompt so the LLM can use it
             prompt = (
                 f'OCR TEXT from camera: "{ocr_text}"\n'
                 f'Sign direction: {direction}\n'
                 f"{priority_context()}\n"
-                f"Should I alert the user? If yes, include the direction naturally in your response."
+                f"Should I alert the user? Include the direction naturally in your response."
             )
-            response = call_ollama(prompt)
+            response = call_ollama(prompt, system_prompt=SYSTEM_PROMPT_WATCHER)
             print(f"[LLM -> OCR] {response}")
 
-            if response and response != "IGNORE":
+            if response and response.upper().strip() != "IGNORE":
                 speak(response.strip())
 
             ocr_queue.task_done()
 
         except queue.Empty:
             continue
-
 
 def _handle_command_response(response: str):
     global user_priority_list
@@ -861,14 +832,8 @@ def preprocess_crop(crop: np.ndarray) -> np.ndarray:
 # ─────────────────────────────────────────────
 #  [OCR-1] DEDICATED OCR THREAD
 # ─────────────────────────────────────────────
-def ocr_worker():
-    """
-    Runs EasyOCR in its own thread so camera_worker() never blocks on readtext().
 
-    [DIR-4] crop_queue items are now (crop, (x1,y1,x2,y2), annotated_frame).
-    [DIR-5] Direction is computed here from the box coords + frame width, then
-            passed through to both the passive alert and the LLM queue.
-    """
+def ocr_worker():
     print("[OCR] Initializing EasyOCR...")
     reader = easyocr.Reader(["en"], gpu=True)
     print("[OCR] Ready.")
@@ -880,14 +845,10 @@ def ocr_worker():
             continue
 
         try:
-            # [DIR-4] Unpack the extended tuple
             crop, box_coords, annotated_frame = item
             x1, y1, x2, y2 = box_coords
 
-            # Infer frame width from the annotated frame shape
             frame_h, frame_w = annotated_frame.shape[:2]
-
-            # [DIR-1] Compute direction before OCR so it's ready when we need it
             direction = get_direction(x1, x2, frame_w)
 
             ocr_results = reader.readtext(crop, detail=0, paragraph=True)
@@ -899,14 +860,13 @@ def ocr_worker():
 
                 print(f"[OCR] '{text}'  →  {direction}")
 
-                if not is_duplicate(text):
-                    # Passive AI path: immediate rule-based safety alert
-                    # [DIR-5] Pass direction into build_passive_alert
-                    priority_key, passive_alert = build_passive_alert(text, direction)
+                if is_duplicate(text):
+                    continue
 
-                    if passive_alert and priority_key and should_speak_priority_alert(priority_key):
-                        # [DIR-3] Save snapshot before speaking so the file is on
-                        #         disk by the time the user hears the audio alert
+                priority_key, passive_alert = build_passive_alert(text, direction)
+
+                if passive_alert and priority_key:
+                    if should_speak_priority_alert(priority_key):
                         save_alert_snapshot(
                             annotated_frame,
                             (x1, y1, x2, y2),
@@ -915,15 +875,13 @@ def ocr_worker():
                         )
                         speak(passive_alert)
 
-                    elif len(text) > 3:
-                        # [DIR-6] Non-priority text → LLM, carry direction along
-                        ocr_queue.put((text, direction))
+                elif len(text) > 3:
+                    ocr_queue.put((text, direction))
 
         except Exception as e:
             print(f"[OCR Error] {e}")
         finally:
             crop_queue.task_done()
-
 
 # ─────────────────────────────────────────────
 #  CAMERA + YOLO
