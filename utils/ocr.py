@@ -42,28 +42,28 @@ def ocr_worker():
             item = state.crop_queue.get(timeout=0.5)
         except queue.Empty:
             continue
- 
+
         try:
             crop, box_coords, annotated_frame = item
             x1, y1, x2, y2 = box_coords
- 
+
             frame_h, frame_w = annotated_frame.shape[:2]
             direction = get_direction(x1, x2, frame_w)
- 
+
             ocr_results = reader.readtext(crop, detail=0, paragraph=True)
- 
+
             for text in ocr_results:
                 text = text.strip()
                 if len(text) < 2:
                     continue
- 
+
                 print(f"[OCR] '{text}'  →  {direction}")
- 
+
                 if is_duplicate(text):
                     continue
- 
+
                 priority_key, passive_alert = build_passive_alert(text, direction)
- 
+
                 if passive_alert and priority_key:
                     if should_speak_priority_alert(priority_key):
                         save_alert_snapshot(
@@ -73,14 +73,14 @@ def ocr_worker():
                             direction,
                         )
                         speak(passive_alert)
- 
+
                         # One-time detection: remove from list after speaking
                         if priority_key in state.user_priority_list:
                             state.user_priority_list.discard(priority_key)
                             print(f"[Priority] '{priority_key}' detected once — removed from list.")
- 
+
                 # non-priority text: drop silently, no LLM call
- 
+
         except Exception as e:
             print(f"[OCR Error] {e}")
         finally:

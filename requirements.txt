@@ -1,0 +1,61 @@
+# ============================================================
+#  requirements.txt — Vision Assistant
+#
+#  Install all at once:
+#      pip install -r requirements.txt
+#
+#  Platform notes for PyAudio:
+#    Windows:  pip install pipwin && pipwin install pyaudio
+#    macOS:    brew install portaudio && pip install pyaudio
+#    Linux:    sudo apt install portaudio19-dev && pip install pyaudio
+#
+#  Platform notes for audio playback (gTTS output):
+#    macOS:    afplay  — built-in, nothing to install
+#    Linux:    sudo apt install ffmpeg
+#    Windows:  default  (see bottom of file)
+# ============================================================
+
+# ── PyTorch — MUST be installed as a matched pair ────────
+# Keep old pins. torch 2.0.1 supports weights_only=False used in
+# camera.py's torch_safe_load patch — no upgrade needed.
+torch==2.0.1
+torchvision==0.15.2
+# NOTE: Do NOT bump torch without also bumping torchvision to its pair:
+#   2.1.x → 0.16.x  |  2.2.x → 0.17.x  |  2.3.x → 0.18.x
+#   2.4.x → 0.19.x  |  2.5.x → 0.20.x  |  2.6.x → 0.21.x
+
+# ── Computer vision & ML ─────────────────────────────────
+ultralytics==8.0.203           # YOLOv8 — pinned to old tested version
+opencv-python==4.8.1.78        # cv2 — pinned to old tested version
+easyocr==1.7.0                 # OCR engine
+numpy==1.24.3                  # pinned — numpy 2.x is a breaking change
+Pillow==10.0.1                 # PIL — pinned to old tested version
+
+# ── Web server (kept from old project) ───────────────────
+Flask==2.3.3                   # retained — may still be used by old routes
+Werkzeug==2.3.7                # Flask dependency — must match Flask version
+
+# ── WebSocket server (new project) ───────────────────────
+websockets>=12.0               # WebSocket server for Flutter client
+
+# ── HTTP client ──────────────────────────────────────────
+requests>=2.31.0               # Ollama REST calls
+
+# ── Speech — input ───────────────────────────────────────
+SpeechRecognition>=3.10.0      # voice_worker (Google STT)
+pyaudio>=0.2.13                # microphone backend for SpeechRecognition
+
+# ── Speech — output (TTS) ────────────────────────────────
+gTTS>=2.4.0                    # primary TTS (Google Text-to-Speech)
+pyttsx3==2.90                  # fallback offline TTS — pinned to old version
+
+# ── Translation ──────────────────────────────────────────
+googletrans==4.0.0rc1          # pin to rc1 — newer versions break the async API
+
+# ── Utilities ────────────────────────────────────────────
+imutils==0.5.4                 # retained from old project (image utilities)
+
+# ── Windows-only audio playback ──────────────────────────
+# Keep for Windows only (macOS uses afplay, Linux uses ffmpeg/ffplay):
+sounddevice>=0.4.6
+soundfile>=0.12.1

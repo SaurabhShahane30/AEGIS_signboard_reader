@@ -163,6 +163,3 @@ def llm_worker():
             state.speech_queue.task_done()
         except queue.Empty:
             continue
- 
-        except queue.Empty:
-            continue

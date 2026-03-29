@@ -17,6 +17,7 @@ Outgoing messages to Flutter:
 import json
 import asyncio
 import base64
+import queue
 import threading
 import socket
 
@@ -33,8 +34,17 @@ from . import state
 # ─────────────────────────────────────────────────────────
 
 def broadcast_event(event: dict):
-    """Push an event dict to all connected Flutter clients."""
-    state.ws_event_queue.put(event)
+    """Push an event dict to all connected Flutter clients.
+
+    Uses put_nowait so callers (camera thread, TTS thread, etc.) are never
+    blocked if no Flutter client is connected and the queue fills up.
+    The oldest event is silently dropped when the queue is at capacity.
+    """
+    try:
+        state.ws_event_queue.put_nowait(event)
+    except Exception:
+        # Queue full (no client draining it) — drop the event silently.
+        pass
 
 
 # ─────────────────────────────────────────────────────────
@@ -100,7 +110,12 @@ async def ws_event_broadcaster():
             event = await loop.run_in_executor(
                 None, state.ws_event_queue.get, True, 0.1
             )
-        except Exception:
+        except queue.Empty:
+            # Timeout with no events — expected, just loop again
+            await asyncio.sleep(0.05)
+            continue
+        except Exception as e:
+            print(f"[WS Broadcaster] Unexpected error on queue.get: {e}")
             await asyncio.sleep(0.05)
             continue
 

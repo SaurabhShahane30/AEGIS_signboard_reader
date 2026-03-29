@@ -20,7 +20,7 @@ ws_frame_queue = queue.Queue(maxsize=5)   # Flutter → camera_worker frames
 # ── WebSocket state ───────────────────────────────────────
 ws_clients      = set()
 ws_clients_lock = threading.Lock()
-ws_event_queue  = queue.Queue()
+ws_event_queue  = queue.Queue(maxsize=100)  # capped — drops oldest if no client consuming
 
 # ── Shared data structures ───────────────────────────────
 recent_texts             = deque(maxlen=30)
