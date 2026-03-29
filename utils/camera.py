@@ -16,7 +16,8 @@ import queue as _queue
 from . import state
 from .config import (
     MODEL_PATH, CAMERA_INDEX, CONFIDENCE_THRESHOLD,
-    MIN_BOX_AREA, WAKE_WORD, ALERT_SNAPSHOT_DIR, INPUT_SOURCE, STREAM_FPS, JPEG_QUALITY
+    MIN_BOX_AREA, WAKE_WORD, ALERT_SNAPSHOT_DIR, INPUT_SOURCE, STREAM_FPS, JPEG_QUALITY,
+    ESP32_STREAM_URL, ESP32_RECONNECT_SEC,
 )
 from .tts import speak
 from .websocket_server import broadcast_event
@@ -114,22 +115,36 @@ def _broadcast_frame(annotated, detections):
     })
  
  
+def _open_esp32_cap() -> cv2.VideoCapture | None:
+    """
+    Open the ESP32-CAM MJPEG stream.  Returns the VideoCapture on success,
+    or None if the stream cannot be reached.
+    """
+    print(f"[Camera] Connecting to ESP32-CAM stream: {ESP32_STREAM_URL}")
+    cap = cv2.VideoCapture(ESP32_STREAM_URL)
+    if cap.isOpened():
+        print("[Camera] ESP32-CAM stream open.")
+        return cap
+    cap.release()
+    print(f"[Camera] Could not open ESP32-CAM stream. Will retry in {ESP32_RECONNECT_SEC}s.")
+    return None
+
+
 def camera_worker():
     """
     Camera thread: capture → YOLO → push crops to crop_queue.
- 
-    INPUT_SOURCE = "local"   → reads from laptop webcam
-    INPUT_SOURCE = "flutter" → reads frames from ws_frame_queue
-                               (filled by websocket_server when Flutter sends frames)
- 
-    In both cases the annotated frame is:
-      - shown in a local cv2 window  (local source only)
-      - broadcast to Flutter over WS (always)
+
+    INPUT_SOURCE = "local"   → laptop webcam + local cv2 window
+    INPUT_SOURCE = "flutter" → frames from Flutter over WebSocket;
+                               annotated frame broadcast back to Flutter
+    INPUT_SOURCE = "esp32"   → ESP32-CAM HTTP MJPEG stream + local cv2 window
+                               (mic and output behave identically to "local")
     """
     print("[Camera] Loading YOLO model...")
     model = YOLO(MODEL_PATH)
- 
+
     cap = None
+
     if INPUT_SOURCE == "local":
         cap = cv2.VideoCapture(CAMERA_INDEX)
         if not cap.isOpened():
@@ -141,49 +156,66 @@ def camera_worker():
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
         print("[Camera] Local webcam open.")
-    else:
+
+    elif INPUT_SOURCE == "esp32":
+        cap = _open_esp32_cap()
+        # cap may be None here; the loop below handles reconnection.
+
+    else:  # "flutter"
         print("[Camera] Flutter source — waiting for frames over WebSocket.")
- 
-    print("[Camera] Running. Press Q to quit (local mode only).\n")
+
+    print("[Camera] Running. Press Q to quit (local/esp32 mode only).\n")
     speak("System ready. Say hey system to give a command.")
- 
+
     last_stream_time = 0
     stream_interval  = 1.0 / STREAM_FPS
- 
+
     while state.running:
- 
+
         # ── Get next frame ──────────────────────────────────────
-        if INPUT_SOURCE == "local":
+        if INPUT_SOURCE in ("local", "esp32"):
+
+            # ESP32 reconnection logic
+            if INPUT_SOURCE == "esp32" and (cap is None or not cap.isOpened()):
+                time.sleep(ESP32_RECONNECT_SEC)
+                cap = _open_esp32_cap()
+                continue
+
             ret, frame = cap.read()
             if not ret:
+                if INPUT_SOURCE == "esp32":
+                    print("[Camera] ESP32 stream lost — reconnecting...")
+                    cap.release()
+                    cap = None
                 time.sleep(0.05)
                 continue
-        else:
+
+        else:  # "flutter"
             try:
                 frame = state.ws_frame_queue.get(timeout=0.5)
             except _queue.Empty:
                 continue
- 
+
         # ── YOLO + crop queue ───────────────────────────────────
         annotated, detections = _run_yolo_and_queue_crops(model, frame)
- 
+
         # ── HUD overlay ────────────────────────────────────────
         annotated = _draw_hud(annotated)
- 
+
         # ── Broadcast to Flutter (rate-limited) ─────────────────
         now = time.time()
         if now - last_stream_time >= stream_interval:
             last_stream_time = now
             _broadcast_frame(annotated, detections)
- 
-        # ── Local window (only in local mode) ───────────────────
-        if INPUT_SOURCE == "local":
+
+        # ── Local window (local and esp32 modes) ─────────────────
+        if INPUT_SOURCE in ("local", "esp32"):
             cv2.imshow("Vision Assistant", annotated)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
- 
+
     if cap is not None:
         cap.release()
-    if INPUT_SOURCE == "local":
+    if INPUT_SOURCE in ("local", "esp32"):
         cv2.destroyAllWindows()
     print("[Camera] Stopped.")
