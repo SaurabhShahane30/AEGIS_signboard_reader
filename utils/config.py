@@ -5,10 +5,9 @@
 """
 
 # ── Input source ─────────────────────────────────────────
-# "local"   = laptop webcam + laptop mic; output on local cv2 window
-# "flutter" = video + audio from Flutter app over WebSocket; output back to app
-# "esp32"   = video from ESP32-CAM HTTP stream + laptop mic; output on local cv2 window
-INPUT_SOURCE = "esp32"
+# "local"   = laptop camera + laptop microphone
+# "flutter" = video frames + voice commands from Flutter over WebSocket
+INPUT_SOURCE = "flutter"
 
 # ── Model & Camera ───────────────────────────────────────
 MODEL_PATH           = "signboard_project/best_yolov8s.pt"
@@ -22,8 +21,8 @@ ESP32_RECONNECT_SEC  = 3              # seconds to wait before retrying a droppe
 # ── WebSocket streaming (for external display) ─────────────
 WS_HOST      = "0.0.0.0"
 WS_PORT      = 8765
-JPEG_QUALITY = 65
-STREAM_FPS   = 15
+JPEG_QUALITY = 40
+STREAM_FPS   = 12
 
 # ── Detection thresholds ─────────────────────────────────
 CONFIDENCE_THRESHOLD = 0.5            # raise if too many false detections
