@@ -73,7 +73,7 @@
 # ── Input source ─────────────────────────────────────────
 # "local"   = laptop camera + laptop microphone
 # "flutter" = video frames + voice commands from Flutter over WebSocket
-INPUT_SOURCE = "local"
+INPUT_SOURCE = "flutter"
 
 # ── Model & Camera ───────────────────────────────────────
 MODEL_PATH           = "signboard_project/best_yolov8s.pt"
@@ -82,8 +82,8 @@ CAMERA_INDEX         = 0              # 0 = default webcam. Used if input source
 # ── WebSocket streaming (for external display) ─────────────
 WS_HOST      = "0.0.0.0"
 WS_PORT      = 8765
-JPEG_QUALITY = 65
-STREAM_FPS   = 15
+JPEG_QUALITY = 40
+STREAM_FPS   = 12
 
 # ── Detection thresholds ─────────────────────────────────
 CONFIDENCE_THRESHOLD = 0.5            # raise if too many false detections
