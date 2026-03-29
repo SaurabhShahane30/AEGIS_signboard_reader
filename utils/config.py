@@ -123,13 +123,13 @@ OLLAMA_MODEL = "llama3.1:8b"
 #   "hi" → Hindi
 #   "mr" → Marathi   "ta" → Tamil   "bn" → Bengali
 #   "es" → Spanish   "fr" → French
-TARGET_LANGUAGE = "hi"
+TARGET_LANGUAGE = "en"
 
 # SOURCE_LANGUAGE : BCP-47 code passed to Google STT for voice input recognition
 #   "en-US"  → English (United States)
 #   "hi-IN"  → Hindi (India) — switch here when speaking Hindi commands
 #   "es-ES"  → Spanish (Spain)
-SOURCE_LANGUAGE = "hi-IN"
+SOURCE_LANGUAGE = "en"
 
 TTS_HTTP_TIMEOUT_SEC = 12
 
