@@ -198,4 +198,3 @@ def tts_worker():
 
 def speak(text: str):
     state.tts_queue.put(text)
-

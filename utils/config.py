@@ -36,8 +36,19 @@ OLLAMA_URL   = "http://localhost:11434/api/generate"
 OLLAMA_MODEL = "llama3.1:8b"
 
 # ── Speech / Translation ─────────────────────────────────
-TARGET_LANGUAGE      = "en"           # e.g. "en", "hi", "es"
-SOURCE_LANGUAGE      = "auto"
+# TARGET_LANGUAGE : BCP-47 code for TTS output + translation destination
+#   "en" → English (no translation performed)
+#   "hi" → Hindi
+#   "es" → Spanish
+#   "mr" → Marathi   "ta" → Tamil   "bn" → Bengali   "fr" → French
+TARGET_LANGUAGE      = "en"
+ 
+# SOURCE_LANGUAGE : BCP-47 code passed to Google STT for voice input recognition
+#   "en-US"  → English (United States)
+#   "hi-IN"  → Hindi (India)   ← switch here for Hindi voice commands
+#   "es-ES"  → Spanish (Spain)
+#   Keep "en-US" if voice commands are in English regardless of TTS output language.
+SOURCE_LANGUAGE      = "en-US"
 TTS_HTTP_TIMEOUT_SEC = 12
 
 # ── Persistence ──────────────────────────────────────────

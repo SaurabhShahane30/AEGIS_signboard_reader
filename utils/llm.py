@@ -46,8 +46,13 @@ UNKNOWN: <short helpful reply>
 Rules:
 - Infer intent, don't require exact keywords
 - "notify/alert/watch for/remember" → ADD
+- "jodo/shamil karo/yaad rakh/track karo/जोड़ो/शामिल करो" → ADD
 - "stop tracking/remove/don't alert" → REMOVE
+- "hatao/hata do/band karo/हटाओ/हटा दो" → REMOVE
+- "meri list/list dikhao/priorities batao/मेरी लिस्ट" → LIST
+- "saaf karo/sab hatao/साफ करो/सब हटाओ" → CLEAR
 - Normalize item: lowercase, singular, no filler words
+- Extract the item noun — ignore Hindi grammar particles (ko, mein, se, ki, ka)
 - Output EXACTLY one line, no markdown, no explanation
 
 Examples:
