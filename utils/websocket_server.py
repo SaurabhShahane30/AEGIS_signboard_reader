@@ -4,14 +4,16 @@
 ============================================================
 
 Incoming messages from Flutter:
-  {type: "frame",         data: <base64 JPEG>}   — video frame (flutter source)
-  {type: "voice_command", text: <string>}         — voice command (flutter source)
+  {type: "frame",         data: <base64 JPEG>}                      — video frame (flutter source)
+  {type: "voice_command", text: <string>}                           — voice command (flutter source)
+  {type: "set_language",  source_language: <str>, target_language: <str>}  — language switch
 
 Outgoing messages to Flutter:
   {type: "frame",              data: <base64 JPEG>, detections: [...]}
   {type: "alert",              text: <string>, timestamp: <ISO>}
-  {type: "init",               priorities: [...], critical: [...]}
+  {type: "init",               priorities: [...], critical: [...], source_language: <str>, target_language: <str>}
   {type: "priorities_updated", priorities: [...]}
+  {type: "language_updated",   source_language: <str>, target_language: <str>}
 """
 
 import json
@@ -27,6 +29,14 @@ import websockets
 
 from .config import WS_HOST, WS_PORT, INPUT_SOURCE, CRITICAL_LIST
 from . import state
+
+
+# ─────────────────────────────────────────────────────────
+#  Valid language codes accepted from Flutter
+# ─────────────────────────────────────────────────────────
+
+VALID_SOURCE_LANGUAGES = {"en-US", "hi-IN"}
+VALID_TARGET_LANGUAGES = {"en", "hi"}
 
 
 # ─────────────────────────────────────────────────────────
@@ -56,11 +66,14 @@ async def ws_handler(websocket):
     with state.ws_clients_lock:
         state.ws_clients.add(websocket)
 
-    # Send initial state so Flutter can populate its priorities tab immediately
+    # Send initial state so Flutter can populate its priorities tab and
+    # language dropdowns immediately on connect
     await websocket.send(json.dumps({
-        "type":       "init",
-        "priorities": list(state.user_priority_list),
-        "critical":   list(CRITICAL_LIST),
+        "type":            "init",
+        "priorities":      list(state.user_priority_list),
+        "critical":        list(CRITICAL_LIST),
+        "source_language": state.source_language,
+        "target_language": state.target_language,
     }))
 
     try:
@@ -86,6 +99,34 @@ async def ws_handler(websocket):
                     if text:
                         print(f"[WS] Voice command from Flutter: '{text}'")
                         state.speech_queue.put(text)
+
+                # ── Language switch from Flutter ─────────────────
+                elif msg_type == "set_language":
+                    src = msg.get("source_language", "").strip()
+                    tgt = msg.get("target_language", "").strip()
+
+                    if src in VALID_SOURCE_LANGUAGES:
+                        state.source_language = src
+                    else:
+                        print(f"[WS] Ignored unknown source_language: '{src}'")
+
+                    if tgt in VALID_TARGET_LANGUAGES:
+                        state.target_language = tgt
+                    else:
+                        print(f"[WS] Ignored unknown target_language: '{tgt}'")
+
+                    print(
+                        f"[WS] Language updated → "
+                        f"source={state.source_language}, target={state.target_language}"
+                    )
+
+                    # Broadcast to all clients so every connected Flutter instance
+                    # stays in sync (e.g. if two phones are connected)
+                    broadcast_event({
+                        "type":            "language_updated",
+                        "source_language": state.source_language,
+                        "target_language": state.target_language,
+                    })
 
             except Exception as e:
                 print(f"[WS] Message error: {e}")
