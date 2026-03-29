@@ -89,7 +89,7 @@ def _draw_hud(annotated):
     )
     cv2.putText(annotated, f"Vision Assistant  {ts}",
                 (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-    cv2.putText(annotated, f"Say: '{WAKE_WORD}' + command",
+    cv2.putText(annotated, f"Say: '{WAKE_WORD}' or ask what is in my vision",
                 (10, 56), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 255, 180), 1)
     cv2.putText(
         annotated,

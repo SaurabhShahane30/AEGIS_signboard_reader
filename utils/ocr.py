@@ -11,6 +11,7 @@ import easyocr
 
 from . import state
 from .direction import get_direction
+from .scene import record_signboard
 from .priority import is_duplicate, build_passive_alert, should_speak_priority_alert
 from .snapshot import save_alert_snapshot
 from .tts import speak
@@ -61,6 +62,9 @@ def ocr_worker():
 
                 if is_duplicate(text):
                     continue
+
+                frame_h, frame_w = annotated_frame.shape[:2]
+                record_signboard(text, direction, x1, y1, x2, y2, frame_w, frame_h)
 
                 priority_key, passive_alert = build_passive_alert(text, direction)
 

@@ -5,12 +5,15 @@
 """
 
 import queue
+import re
 import requests
+from typing import Optional
 
 from .config import OLLAMA_URL, OLLAMA_MODEL
 from . import state
 from .tts import speak
 from .priority import priority_context
+from .scene import scene_context_lines
 from .websocket_server import broadcast_event
 
 
@@ -74,6 +77,74 @@ Output: CLEAR:
 Input: hello how are you
 Output: UNKNOWN: I can add, remove, list, or clear priority items."""
 
+SYSTEM_PROMPT_VISION_CHAT = """You are a friendly vision assistant. The user asked what text or signboards are visible around them.
+
+You receive OCR observations: each line has quoted text, a direction (e.g. to your left, straight ahead), and a distance_hint from how large the sign appears in the camera (not a laser range — use soft wording like "close by", "a bit farther", "in the distance").
+
+Rules:
+- Answer in 1–4 short sentences, natural spoken English, like a helpful friend.
+- Mention several signs if listed; put clearer / closer-sounding ones first when it makes sense.
+- Weave direction and distance into the sentence (e.g. "There's a Samsung sign to your left, and ahead you can make out text about a temple, though it looks farther away.").
+- Do NOT invent signs or text that are not in the observations.
+- Do NOT use bullet points, markdown, or role labels.
+- If observations seem noisy or partial, say so briefly."""
+
+
+# ─────────────────────────────────────────────────────────
+#  Active / conversational vision query
+# ─────────────────────────────────────────────────────────
+
+def _is_vision_query(cmd: str) -> bool:
+    """True when the user wants a description of current signboard / scene text."""
+    t = cmd.lower().strip()
+    if re.search(r"\bwhat\s+are\s+my\s+priorities\b", t):
+        return False
+    if "priority" in t and "vision" not in t and any(
+        x in t for x in ("list", "priorities", "clear", "remove", "add ")
+    ):
+        # Narrow: avoid stealing priority commands; "add pharmacy" has "add "
+        if t.startswith("add ") or t.startswith("remove ") or "priorities" in t:
+            return False
+    snippets = (
+        "what is in my vision",
+        "what's in my vision",
+        "whats in my vision",
+        "what do i see",
+        "what can i see",
+        "describe what i see",
+        "describe my vision",
+        "what can you see",
+        "what signs are around",
+        "what signboards",
+        "tell me what's around",
+        "what's around me",
+        "what is around me",
+        "what's in front of me",
+        "what is visible",
+        "what's visible",
+        "what do you see",
+    )
+    return any(s in t for s in snippets)
+
+
+def describe_vision_now() -> Optional[str]:
+    """
+    Build a natural-language summary of the rolling OCR scene buffer.
+    Returns None if there is nothing to describe yet.
+    """
+    block = scene_context_lines()
+    if not block.strip():
+        return None
+    prompt = (
+        "The user asked what signboards or readable text are visible around them.\n"
+        "Use ONLY the observations below. Do not invent content.\n\n"
+        f"{block}"
+    )
+    raw = call_ollama(prompt, system_prompt=SYSTEM_PROMPT_VISION_CHAT, num_predict=160)
+    if not raw or raw.upper().startswith("IGNORE"):
+        return "I could not turn that into a clear description. Try again in a moment."
+    return raw.strip()
+
 
 # ─────────────────────────────────────────────────────────
 #  Core Ollama call
@@ -102,7 +173,11 @@ def _extract_structured_line(raw: str) -> str:
     return raw.strip()
 
 
-def call_ollama(prompt: str, system_prompt: str = SYSTEM_PROMPT_WATCHER) -> str:
+def call_ollama(
+    prompt: str,
+    system_prompt: str = SYSTEM_PROMPT_WATCHER,
+    num_predict: int = 60,
+) -> str:
     try:
         payload = {
             "model":  OLLAMA_MODEL,
@@ -111,7 +186,7 @@ def call_ollama(prompt: str, system_prompt: str = SYSTEM_PROMPT_WATCHER) -> str:
             "stream": False,
             "options": {
                 "temperature": 0.1,
-                "num_predict": 60,          # slight headroom so long UNKNOWN replies aren't cut
+                "num_predict": num_predict,
             },
         }
         resp = requests.post(OLLAMA_URL, json=payload, timeout=15)
@@ -183,6 +258,20 @@ def llm_worker():
         try:
             command = state.speech_queue.get(timeout=0.3)
             print(f"\n🎤 Command: '{command}'")
+
+            if _is_vision_query(command):
+                desc = describe_vision_now()
+                if desc is None:
+                    speak(
+                        "I don't have any sign text in view right now. "
+                        "Try aiming the camera at signboards."
+                    )
+                else:
+                    speak(desc)
+                print(f"[LLM -> Vision] (spoken)")
+                state.speech_queue.task_done()
+                continue
+
             prompt = (
                 f'USER_UTTERANCE: "{command}"\n'
                 f"{priority_context()}"

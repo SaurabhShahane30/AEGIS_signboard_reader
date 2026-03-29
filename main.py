@@ -19,6 +19,10 @@ VOICE COMMANDS (say "Hey system" first):
     "remove stop from priority"
     "what are my priorities?"
     "clear user list"
+
+ACTIVE AI (vision chat — direct or after wake word):
+    "what is in my vision" / "what do I see" / "describe what I see"
+    → speaks a natural summary of signboards OCR has recently seen (direction + distance hint).
 """
 
 import sys

@@ -8,7 +8,7 @@
 # "local"   = laptop webcam + laptop mic; output on local cv2 window
 # "flutter" = video + audio from Flutter app over WebSocket; output back to app
 # "esp32"   = video from ESP32-CAM HTTP stream + laptop mic; output on local cv2 window
-INPUT_SOURCE = "local"
+INPUT_SOURCE = "esp32"
 
 # ── Model & Camera ───────────────────────────────────────
 MODEL_PATH           = "signboard_project/best_yolov8s.pt"

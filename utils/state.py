@@ -29,6 +29,9 @@ recent_texts              = deque(maxlen=30)
 last_priority_alert_times = {}
 translation_cache         = {}
 
+# Rolling OCR sign observations for "what do I see" / active AI (see utils/scene.py)
+scene_signboards = deque(maxlen=40)
+
 # ── Synchronisation ──────────────────────────────────────
 lock = threading.Lock()
 
