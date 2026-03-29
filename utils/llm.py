@@ -74,20 +74,45 @@ Output: UNKNOWN: I can add, remove, list, or clear priority items."""
 #  Core Ollama call
 # ─────────────────────────────────────────────────────────
 
+# Keywords that mark a valid structured response line
+_VALID_PREFIXES = ("ADD:", "REMOVE:", "LIST:", "CLEAR:", "UNKNOWN:", "IGNORE")
+
+
+def _extract_structured_line(raw: str) -> str:
+    """
+    Pull the first line that starts with a known structured prefix.
+    Guards against models that add preamble like 'Here is the parsed action:'
+    before the actual output line.
+    """
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        upper = stripped.upper()
+        for prefix in _VALID_PREFIXES:
+            if upper.startswith(prefix):
+                return stripped
+    # Nothing matched — return the raw response so the else branch in the
+    # handler can speak it as a fallback rather than silently dropping it.
+    return raw.strip()
+
+
 def call_ollama(prompt: str, system_prompt: str = SYSTEM_PROMPT_WATCHER) -> str:
     try:
         payload = {
-            "model": OLLAMA_MODEL,
-            "prompt": f"{system_prompt}\n\n{prompt}",
+            "model":  OLLAMA_MODEL,
+            "system": system_prompt,        # dedicated system field — keeps it out of prompt
+            "prompt": prompt,
             "stream": False,
             "options": {
                 "temperature": 0.1,
-                "num_predict": 40,
+                "num_predict": 60,          # slight headroom so long UNKNOWN replies aren't cut
             },
         }
         resp = requests.post(OLLAMA_URL, json=payload, timeout=15)
         resp.raise_for_status()
-        return resp.json().get("response", "IGNORE").strip()
+        raw = resp.json().get("response", "IGNORE").strip()
+        return _extract_structured_line(raw)
     except requests.exceptions.ConnectionError:
         print("[Ollama] ERROR: Cannot connect. Is 'ollama serve' running?")
         return "IGNORE"
